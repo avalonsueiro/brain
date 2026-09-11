@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+
+# Runtime state never belongs in git. It lives in $RIG_ROOT/state.
+agent.env
+state.json
+*.db
+*.db-wal
+*.db-shm
+logs/
+backups/
+
+.DS_Store

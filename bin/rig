@@ -1,0 +1,425 @@
+#!/usr/bin/env bash
+# rig -- control script for the agent rig.
+#
+# Hides the one real difference between macOS and Linux: launchd vs systemd.
+# Everything else in this repo is platform-neutral by construction.
+set -euo pipefail
+
+RIG_ROOT="${RIG_ROOT:-/opt/agent-rig}"
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+STATE_DIR="$RIG_ROOT/state"
+LOG_FILE="$STATE_DIR/logs/daemon.log"
+VENV="$REPO_DIR/.venv"
+PY="$VENV/bin/python"
+# Who the daemon runs as. Defaults to whoever is driving.
+#
+# On macOS a dedicated non-GUI user has no login keychain, and that is where
+# Claude Code keeps its OAuth credentials -- so an isolated user cannot
+# authenticate, at login or at turn time. On Linux the problem does not exist:
+# set RIG_USER=agentrig there and `bootstrap` creates a least-privilege account.
+RIG_USER="${RIG_USER:-${SUDO_USER:-$(id -un)}}"
+# Resolved lazily: on a fresh Linux box with RIG_USER=agentrig the account does
+# not exist yet during bootstrap, and eagerly defaulting to `staff` either
+# chowns the tree to the wrong group or (on distros with no `staff` group)
+# aborts bootstrap halfway through under `set -e`.
+rig_group() {
+  if [ -n "${RIG_GROUP:-}" ]; then printf '%s' "$RIG_GROUP"; return; fi
+  id -gn "$RIG_USER" 2>/dev/null || printf '%s' "$RIG_USER"
+}
+
+LABEL="me.avalon.agent-rig"
+UNIT="agent-rig"
+BACKUP_LABEL="me.avalon.agent-rig-backup"
+UNIT_DIR="/etc/systemd/system"
+
+# macOS: a per-user LaunchAgent in the gui/<uid> domain, not a system-domain
+# LaunchDaemon. Claude Code's OAuth credentials live in the login keychain, and
+# a system-domain job has no user session to unlock one -- every turn fails with
+# "Not logged in" even when the job runs as the right user. Consequence: no sudo
+# for install/start/stop, and the rig starts at login rather than at boot.
+RIG_HOME="$(eval echo "~$RIG_USER")"
+RIG_UID="$(id -u "$RIG_USER" 2>/dev/null || id -u)"
+AGENT_DIR="$RIG_HOME/Library/LaunchAgents"
+PLIST_DST="$AGENT_DIR/$LABEL.plist"
+BACKUP_PLIST_DST="$AGENT_DIR/$BACKUP_LABEL.plist"
+DOMAIN="gui/$RIG_UID"
+
+OS="$(uname -s)"
+BACKUP_KEEP="${RIG_BACKUP_KEEP:-48}"
+
+# Scratch dir shared with the EXIT trap. Must not be `local` anywhere.
+STAGE=""
+trap '[ -n "${STAGE:-}" ] && rm -rf "$STAGE"; true' EXIT
+
+die()  { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+info() { printf '\033[36m==>\033[0m %s\n' "$*"; }
+warn() { printf '\033[33mwarn:\033[0m %s\n' "$*" >&2; }
+
+need_root() { [ "$(id -u)" -eq 0 ] || die "run this with sudo: sudo $0 $*"; }
+
+# --- bootstrap -------------------------------------------------------------
+# One-time: create the runtime tree, and the rig user if one was asked for.
+#
+# The daemon runs with --dangerously-skip-permissions, which a daemon must -- it
+# cannot answer a permission prompt, and a turn that stalls on one is a dead
+# channel. Containing the blast radius is therefore the OS's job, not the CLI's.
+#
+# By default RIG_USER is whoever runs this, so no account is created and the
+# only containment is DISCORD_ALLOWED_USER_IDS. On Linux, `RIG_USER=agentrig rig
+# bootstrap` creates a real least-privilege account; on macOS that account
+# cannot authenticate Claude Code (no login keychain for a non-GUI user), which
+# is why it is not the default here.
+
+cmd_bootstrap() {
+  need_root bootstrap
+  local admin="${SUDO_USER:-}"
+
+  if [ "$RIG_USER" != "${SUDO_USER:-$(id -un)}" ] && [ "$OS" = "Darwin" ]; then
+    warn "a dedicated user on macOS has no login keychain and cannot complete"
+    warn "the Claude Code OAuth login. Expect turns to fail. (Linux is fine.)"
+  fi
+
+  if [ "$OS" = "Darwin" ]; then
+    if ! id "$RIG_USER" >/dev/null 2>&1; then
+      info "creating standard user $RIG_USER"
+      sysadminctl -addUser "$RIG_USER" -fullName "Agent Rig" -password - >/dev/null 2>&1 || true
+      id "$RIG_USER" >/dev/null 2>&1 || die "could not create user $RIG_USER"
+      # Keep it off the login window; this account is for the daemon only.
+      dscl . -create "/Users/$RIG_USER" IsHidden 1 || true
+    else
+      info "user $RIG_USER already exists"
+    fi
+    dseditgroup -o create "$(rig_group)" 2>/dev/null || true
+    dseditgroup -o edit -a "$RIG_USER" -t user "$(rig_group)" 2>/dev/null || true
+    [ -n "$admin" ] && dseditgroup -o edit -a "$admin" -t user "$(rig_group)" 2>/dev/null || true
+  else
+    if ! id "$RIG_USER" >/dev/null 2>&1; then
+      info "creating system user $RIG_USER"
+      useradd --system --create-home --shell /bin/bash "$RIG_USER"
+    fi
+    [ -n "$admin" ] && usermod -aG "$(rig_group)" "$admin" || true
+  fi
+
+  info "creating $RIG_ROOT"
+  mkdir -p "$RIG_ROOT"/{workdirs,state/{logs,backups}}
+  chown -R "$RIG_USER:$(rig_group)" "$RIG_ROOT"
+  chmod -R g+rwX "$RIG_ROOT"
+  find "$RIG_ROOT" -type d -exec chmod g+s {} +   # new files inherit the group
+
+  if [ ! -f "$STATE_DIR/agent.env" ]; then
+    install -o "$RIG_USER" -g "$(rig_group)" -m 600 /dev/null "$STATE_DIR/agent.env"
+    cat > "$STATE_DIR/agent.env" <<'ENV'
+# Discord application -> Bot. MESSAGE CONTENT INTENT must be enabled.
+DISCORD_BOT_TOKEN=
+DISCORD_GUILD_ID=
+# Guild membership is not authorization. Only these ids can trigger turns.
+DISCORD_ALLOWED_USER_IDS=
+DISCORD_IGNORE_CHANNELS=alerts
+
+MAX_CONCURRENT_TURNS=3
+TURN_TIMEOUT=2500
+RIG_TZ=America/New_York
+DEFAULT_MODEL=opus
+ENV
+    info "wrote $STATE_DIR/agent.env -- fill it in"
+  fi
+
+  cat <<EOF
+
+Runtime tree ready at $RIG_ROOT, owned by $RIG_USER:$(rig_group).
+
+Next:
+  1. sudo mv "$REPO_DIR" $RIG_ROOT/brain   (and: ln -s $RIG_ROOT/brain ~/brain)
+  2. \$EDITOR $STATE_DIR/agent.env
+  3. make sure Claude Code is logged in as $RIG_USER, and that
+     "cleanupPeriodDays": 365 is set in ~$RIG_USER/.claude/settings.json
+  4. $RIG_ROOT/brain/bin/rig venv
+  5. $RIG_ROOT/brain/bin/rig install   (macOS: no sudo)
+EOF
+}
+
+cmd_venv() {
+  info "creating venv at $VENV"
+  python3 -m venv "$VENV"
+  "$VENV/bin/pip" install --quiet --upgrade pip
+  "$VENV/bin/pip" install --quiet -r "$REPO_DIR/requirements.txt"
+  "$VENV/bin/python" -c "import discord; print('discord.py', discord.__version__)"
+}
+
+# --- service ---------------------------------------------------------------
+
+render() {  # render <src> <dst>
+  sed -e "s|__RIG_ROOT__|$RIG_ROOT|g" \
+      -e "s|__REPO_DIR__|$RIG_ROOT/brain|g" \
+      -e "s|__RIG_USER__|$RIG_USER|g" \
+      -e "s|__RIG_GROUP__|$(rig_group)|g" \
+      "$1" > "$2"
+}
+
+cmd_install() {
+  [ -x "$PY" ] || die "no venv yet -- run '$0 venv' first"
+  [ "$OS" = "Darwin" ] || need_root install
+  [ "$OS" = "Darwin" ] && [ "$(id -u)" -eq 0 ] && \
+    die "do NOT sudo this on macOS -- LaunchAgents belong to your own user"
+
+  if [ "$OS" = "Darwin" ]; then
+    # gui/<uid>, not the system domain: see the DOMAIN comment at the top --
+    # keychain access is the constraint, and it is not negotiable.
+    mkdir -p "$AGENT_DIR"
+    render "$REPO_DIR/infra/launchd/$LABEL.plist" "$PLIST_DST"
+    render "$REPO_DIR/infra/launchd/$BACKUP_LABEL.plist" "$BACKUP_PLIST_DST"
+    chmod 644 "$PLIST_DST" "$BACKUP_PLIST_DST"
+    bootout "$LABEL";        wait_unloaded "$LABEL"
+    bootout "$BACKUP_LABEL";  wait_unloaded "$BACKUP_LABEL"
+    load "$PLIST_DST"
+    load "$BACKUP_PLIST_DST"
+    info "installed $LABEL (+ hourly backup)"
+  else
+    render "$REPO_DIR/infra/systemd/$UNIT.service" "$UNIT_DIR/$UNIT.service"
+    mkdir -p "$UNIT_DIR/$UNIT.service.d"
+    render "$REPO_DIR/infra/systemd/killmode.conf" "$UNIT_DIR/$UNIT.service.d/killmode.conf"
+    render "$REPO_DIR/infra/systemd/$UNIT-backup.service" "$UNIT_DIR/$UNIT-backup.service"
+    render "$REPO_DIR/infra/systemd/$UNIT-backup.timer" "$UNIT_DIR/$UNIT-backup.timer"
+    systemctl daemon-reload
+    systemctl enable --now "$UNIT.service" "$UNIT-backup.timer"
+    info "installed $UNIT.service (+ hourly backup timer)"
+  fi
+  cmd_link_skills
+}
+
+cmd_uninstall() {
+  [ "$OS" = "Darwin" ] || need_root uninstall
+  if [ "$OS" = "Darwin" ]; then
+    bootout "$LABEL"
+    bootout "$BACKUP_LABEL"
+    rm -f "$PLIST_DST" "$BACKUP_PLIST_DST"
+  else
+    systemctl disable --now "$UNIT.service" "$UNIT-backup.timer" 2>/dev/null || true
+    rm -f "$UNIT_DIR/$UNIT.service" "$UNIT_DIR/$UNIT-backup."{service,timer}
+    rm -rf "$UNIT_DIR/$UNIT.service.d"
+    systemctl daemon-reload
+  fi
+  info "uninstalled"
+}
+
+loaded()  { launchctl print "$DOMAIN/$1" >/dev/null 2>&1; }
+bootout() { launchctl bootout "$DOMAIN/$1" 2>/dev/null || true; }
+
+# `bootout` returns as soon as the request is accepted, not when the job is
+# actually gone -- and bootstrapping a label that is still registered fails with
+# the memorable "Bootstrap failed: 5: Input/output error". So wait it out.
+# ExitTimeOut is 300s, but a drained daemon normally exits in well under one.
+wait_unloaded() {
+  local i=0
+  while loaded "$1" && [ "$i" -lt 310 ]; do sleep 1; i=$((i + 1)); done
+  loaded "$1" && die "$1 still loaded after ${i}s; try 'rig stop' then 'rig start'"
+  [ "$i" -gt 0 ] && info "drained in ${i}s"
+  return 0
+}
+
+load() { launchctl bootstrap "$DOMAIN" "$1"; }
+
+# `launchctl kickstart -k` SIGKILLs the running instance -- it never goes
+# through SIGTERM, so the daemon's drain path and the plist's ExitTimeOut are
+# both bypassed and any live turn dies mid-thought. `bootout` does send SIGTERM
+# and honours ExitTimeOut, so restart is bootout-wait-bootstrap.
+cmd_start() {
+  [ "$OS" = "Darwin" ] || need_root start
+  if [ "$OS" = "Darwin" ]; then
+    # After a restart that failed halfway, or a fresh boot, the label may not be
+    # registered at all -- in which case kickstart has nothing to kick.
+    if loaded "$LABEL"; then launchctl kickstart "$DOMAIN/$LABEL"; else load "$PLIST_DST"; fi
+  else
+    systemctl start "$UNIT"
+  fi
+  info started
+}
+
+cmd_stop() {
+  [ "$OS" = "Darwin" ] || need_root stop
+  if [ "$OS" = "Darwin" ]; then bootout "$LABEL"; wait_unloaded "$LABEL"; else systemctl stop "$UNIT"; fi
+  info stopped
+}
+
+cmd_restart() {
+  [ "$OS" = "Darwin" ] || need_root restart
+  if [ "$OS" = "Darwin" ]; then
+    info "draining (up to ExitTimeOut)…"
+    bootout "$LABEL"
+    wait_unloaded "$LABEL"
+    load "$PLIST_DST"
+  else
+    systemctl restart "$UNIT"
+  fi
+  info restarted
+}
+
+cmd_status() {
+  if [ "$OS" = "Darwin" ]; then
+    launchctl print "$DOMAIN/$LABEL" 2>/dev/null | sed -n '1,25p' || echo "not loaded"
+  else
+    systemctl status "$UNIT" --no-pager || true
+  fi
+}
+
+cmd_logs() { [ -f "$LOG_FILE" ] || die "no log at $LOG_FILE"; tail -n "${2:-80}" -f "$LOG_FILE"; }
+
+cmd_run() {  # foreground, for development
+  [ -x "$PY" ] || die "no venv yet -- run '$0 venv' first"
+  cd "$REPO_DIR" && exec "$PY" -m daemon
+}
+
+# --- backup ----------------------------------------------------------------
+# cleanupPeriodDays=365 protects transcripts from garbage collection. It does
+# nothing about disk loss, an accidental !reset, or a botched migration. This
+# does. Runs hourly.
+
+cmd_backup() {
+  umask 077   # these archives contain agent.env
+  local ts out enc
+  ts="$(date +%Y%m%d-%H%M%S)"
+  out="$STATE_DIR/backups/rig-$ts.tar.gz"
+  mkdir -p "$STATE_DIR/backups"
+
+  # STAGE is script-scoped, not local: an EXIT trap fires after the function has
+  # returned, so a `local` would already be out of scope and `set -u` would turn
+  # a successful backup into a non-zero exit -- which reads as a failed job to
+  # launchd and systemd.
+  STAGE="$(mktemp -d)"
+  mkdir -p "$STAGE/state" "$STAGE/transcripts"
+
+  for f in state.json agent.env; do
+    [ -e "$STATE_DIR/$f" ] && cp -a "$STATE_DIR/$f" "$STAGE/state/" || true
+  done
+  # sqlite3 .backup, not cp: the daemon writes this DB continuously, and copying
+  # the .db/-wal/-shm trio file-by-file can capture three mutually inconsistent
+  # snapshots -- a "successful" backup you discover is corrupt at restore time.
+  if [ -e "$STATE_DIR/history.db" ]; then
+    sqlite3 "$STATE_DIR/history.db" ".backup '$STAGE/state/history.db'" \
+      || warn "history.db backup failed"
+  fi
+
+  # Transcript dirs are named after the encoded cwd: / and . both become -.
+  # Resolve the home directory from RIG_USER rather than $HOME: under `sudo rig
+  # backup` $HOME is root's, the glob matches nothing, and the archive would be
+  # written with zero transcripts while still reporting success.
+  local home; home="$(eval echo "~$RIG_USER")"
+  enc="$(printf '%s' "$RIG_ROOT/workdirs" | tr '/.' '--')"
+  local found=0
+  shopt -s nullglob
+  for d in "$home/.claude/projects/$enc"*; do
+    cp -a "$d" "$STAGE/transcripts/"
+    found=$((found + 1))
+  done
+  shopt -u nullglob
+  [ "$found" -eq 0 ] && warn "no transcript directories found under $home/.claude/projects/$enc*"
+
+  tar czf "$out" -C "$STAGE" .
+  info "backup -> $out ($(du -h "$out" | cut -f1))"
+
+  # Rotate.
+  local n
+  n="$(ls -1t "$STATE_DIR/backups"/rig-*.tar.gz 2>/dev/null | wc -l | tr -d ' ')"
+  if [ "$n" -gt "$BACKUP_KEEP" ]; then
+    ls -1t "$STATE_DIR/backups"/rig-*.tar.gz | tail -n +$((BACKUP_KEEP + 1)) | xargs rm -f
+    info "rotated $((n - BACKUP_KEEP)) old backup(s)"
+  fi
+}
+
+cmd_restore() {
+  local archive="${2:-}"
+  [ -n "$archive" ] || die "usage: rig restore <path-to-backup.tar.gz>"
+  [ -f "$archive" ] || die "no such archive: $archive"
+  STAGE="$(mktemp -d)"
+  tar xzf "$archive" -C "$STAGE"
+  cp -a "$STAGE/state/." "$STATE_DIR/"
+  local home; home="$(eval echo "~$RIG_USER")"
+  mkdir -p "$home/.claude/projects"
+  [ -d "$STAGE/transcripts" ] && cp -a "$STAGE/transcripts/." "$home/.claude/projects/"
+  info "restored from $archive -- restart the daemon"
+}
+
+# --- skills ----------------------------------------------------------------
+
+cmd_link_skills() {
+  local dst="$HOME/.claude/skills"
+  [ "$(id -u)" -eq 0 ] && dst="$(eval echo "~$RIG_USER")/.claude/skills"
+  mkdir -p "$dst"
+  shopt -s nullglob
+  for src in "$REPO_DIR/skills"/*/; do
+    local name target
+    name="$(basename "$src")"
+    # Only ever refresh links the rig itself owns. Checking merely "is it a
+    # symlink" protects nothing: the user's own skills are symlinks too (into
+    # ~/.agents/skills), so that test would happily overwrite them.
+    if [ -e "$dst/$name" ] || [ -L "$dst/$name" ]; then
+      target="$(readlink "$dst/$name" 2>/dev/null || true)"
+      case "$target" in
+        "$REPO_DIR/skills/"*) ;;
+        *) warn "skipping skill '$name': $dst/$name exists and is not ours"; continue ;;
+      esac
+    fi
+    ln -sfn "${src%/}" "$dst/$name"
+    info "linked skill $name"
+  done
+  shopt -u nullglob
+}
+
+# --- doctor ----------------------------------------------------------------
+
+cmd_doctor() {
+  local ok=0
+  chk() { if eval "$2" >/dev/null 2>&1; then printf '  \033[32mok\033[0m   %s\n' "$1"; else printf '  \033[31mFAIL\033[0m %s\n' "$1"; ok=1; fi; }
+
+  echo "rig doctor  (RIG_ROOT=$RIG_ROOT, os=$OS, user=$(id -un))"
+  chk "claude on PATH"                 "command -v claude"
+  chk "venv exists"                    "[ -x '$PY' ]"
+  chk "discord.py importable"          "'$PY' -c 'import discord'"
+  chk "$RIG_ROOT/workdirs writable"    "[ -w '$RIG_ROOT/workdirs' ]"
+  chk "$STATE_DIR writable"            "[ -w '$STATE_DIR' ]"
+  chk "agent.env exists"               "[ -f '$STATE_DIR/agent.env' ]"
+  chk "agent.env is 0600"              "[ \"\$(stat -f %Lp '$STATE_DIR/agent.env' 2>/dev/null || stat -c %a '$STATE_DIR/agent.env')\" = 600 ]"
+  chk "DISCORD_BOT_TOKEN set"          "grep -q '^DISCORD_BOT_TOKEN=.\\+' '$STATE_DIR/agent.env'"
+  chk "DISCORD_ALLOWED_USER_IDS set"   "grep -q '^DISCORD_ALLOWED_USER_IDS=.\\+' '$STATE_DIR/agent.env'"
+  chk "cleanupPeriodDays >= 365"       "'$PY' -c \"import json,os,sys; p=os.path.expanduser('~/.claude/settings.json'); sys.exit(0 if json.load(open(p)).get('cleanupPeriodDays',30)>=365 else 1)\""
+  echo
+  [ "$ok" -eq 0 ] && info "all checks passed" || warn "some checks failed"
+  return $ok
+}
+
+# --- dispatch --------------------------------------------------------------
+
+case "${1:-help}" in
+  bootstrap)   cmd_bootstrap "$@" ;;
+  venv)        cmd_venv "$@" ;;
+  install)     cmd_install "$@" ;;
+  uninstall)   cmd_uninstall "$@" ;;
+  start)       cmd_start "$@" ;;
+  stop)        cmd_stop "$@" ;;
+  restart)     cmd_restart "$@" ;;
+  status)      cmd_status "$@" ;;
+  logs)        cmd_logs "$@" ;;
+  run)         cmd_run "$@" ;;
+  backup)      cmd_backup "$@" ;;
+  restore)     cmd_restore "$@" ;;
+  link-skills) cmd_link_skills "$@" ;;
+  doctor)      cmd_doctor "$@" ;;
+  *)
+    cat <<EOF
+usage: rig <command>
+
+  bootstrap     create the $RIG_ROOT tree, owned by $RIG_USER  (sudo, once)
+  venv          create .venv and install requirements
+  install       install and enable the service + hourly backup
+                (macOS: no sudo -- it is your LaunchAgent)
+  uninstall     remove the service
+  start|stop|restart|status        (Linux needs sudo; macOS does not)
+  logs [n]      tail -f the daemon log
+  run           run in the foreground (development)
+  backup        snapshot state + session transcripts
+  restore <f>   restore from a backup archive
+  link-skills   symlink repo skills into ~/.claude/skills
+  doctor        check the install
+EOF
+    ;;
+esac

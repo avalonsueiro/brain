@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Per-user LaunchAgent, matching the daemon's domain so both run as the rig
+     user with access to that user's ~/.claude/projects transcripts. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>me.avalon.agent-rig-backup</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__REPO_DIR__/bin/rig</string>
+    <string>backup</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>RIG_ROOT</key>
+    <string>__RIG_ROOT__</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+
+  <key>StartInterval</key>
+  <integer>3600</integer>
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>__RIG_ROOT__/state/logs/backup.log</string>
+  <key>StandardErrorPath</key>
+  <string>__RIG_ROOT__/state/logs/backup.log</string>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>LowPriorityIO</key>
+  <true/>
+</dict>
+</plist>

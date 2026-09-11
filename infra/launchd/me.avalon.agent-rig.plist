@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  A per-user LaunchAgent loaded into the gui/<uid> domain, NOT a system-domain
+  LaunchDaemon.
+
+  This is forced by authentication, not preference. Claude Code keeps its OAuth
+  credentials in the login keychain, and a system-domain job has no user session
+  to unlock one -- every turn dies with "Not logged in · Please run /login" even
+  when the job is configured to run as you. A LaunchAgent runs inside the user's
+  session and can read the keychain.
+
+  The cost: it starts at login rather than at boot, so a reboot needs someone to
+  log in. On a personal laptop that is what happens anyway, and launchd will not
+  run this with the lid shut regardless -- pair it with `caffeinate -is` or
+  Energy Saver's "prevent sleep on power adapter". Both constraints are the
+  honest reason Phase 4 moves this to a Linux box, where systemd has no keychain
+  and a real system service works.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>me.avalon.agent-rig</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__REPO_DIR__/.venv/bin/python</string>
+    <string>-m</string>
+    <string>daemon</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>__REPO_DIR__</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>RIG_ROOT</key>
+    <string>__RIG_ROOT__</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <!-- Give in-flight turns time to drain on SIGTERM instead of being killed. -->
+  <key>ExitTimeOut</key>
+  <integer>300</integer>
+
+  <key>StandardOutPath</key>
+  <string>__RIG_ROOT__/state/logs/daemon.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>__RIG_ROOT__/state/logs/daemon.err.log</string>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>

@@ -1,0 +1,11 @@
+[Unit]
+Description=Agent rig -- snapshot state and session transcripts
+
+[Service]
+Type=oneshot
+User=__RIG_USER__
+Group=__RIG_GROUP__
+Environment=RIG_ROOT=__RIG_ROOT__
+ExecStart=__REPO_DIR__/bin/rig backup
+Nice=10
+IOSchedulingClass=idle
