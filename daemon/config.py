@@ -23,8 +23,15 @@ REPO_DIR = Path(__file__).resolve().parent.parent
 WORKDIRS_DIR = RIG_ROOT / "workdirs"
 STATE_DIR = RIG_ROOT / "state"
 
+# The inject spool: drop a JSON file here and a turn runs. Anything that can
+# write here gets a turn with --dangerously-skip-permissions and no Discord
+# allowlist check, so the directory is 0700 and every injection posts a visible
+# line to its channel.
+INJECT_DIR = RIG_ROOT / "inject"
+
 ENV_FILE = STATE_DIR / "agent.env"
 STATE_FILE = STATE_DIR / "state.json"
+JOBS_FILE = STATE_DIR / "jobs.json"
 HISTORY_DB = STATE_DIR / "history.db"
 BACKUP_DIR = STATE_DIR / "backups"
 LOG_DIR = STATE_DIR / "logs"
@@ -35,6 +42,8 @@ TEMPLATE_CLAUDE_MD = REPO_DIR / "templates" / "workdir-CLAUDE.md"
 def ensure_dirs() -> None:
     for d in (WORKDIRS_DIR, STATE_DIR, BACKUP_DIR, LOG_DIR):
         d.mkdir(parents=True, exist_ok=True)
+    INJECT_DIR.mkdir(parents=True, exist_ok=True)
+    INJECT_DIR.chmod(0o700)
 
 
 # --- environment -----------------------------------------------------------
@@ -99,6 +108,13 @@ class Config:
         self.turn_timeout = _int("TURN_TIMEOUT", 2500)
         self.tz = os.environ.get("RIG_TZ", "America/New_York")
         self.default_model = os.environ.get("DEFAULT_MODEL", "opus")
+
+        self.inject_poll = _int("INJECT_POLL", 5)
+        self.wake_poll = _int("WAKE_POLL", 20)
+        # How late a wake can be and still be worth firing. This machine sleeps,
+        # so jobs routinely come due with nothing running; a two-hour-late
+        # reminder is still useful, a thirteen-hour-late one is noise.
+        self.wake_max_late = _int("WAKE_MAX_LATE", 12 * 3600)
 
         # off | minimal | full -- what to show under a successful answer.
         # Errors always get a footer regardless: a silent failure is worse than

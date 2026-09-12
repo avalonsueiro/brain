@@ -1,7 +1,8 @@
 # Setup
 
-Phase 1 of the agent rig: one Discord channel, one durable Claude Code session,
-one turn per message. Budget an evening.
+The agent rig: one Discord channel is one durable Claude Code session, resumed
+one turn per message — plus an inject spool and wake scheduler so a turn can
+start without you. Budget an evening.
 
 Order matters. Step 1 is the one that silently destroys sessions a month from
 now if you skip it.
@@ -120,6 +121,9 @@ $EDITOR /opt/agent-rig/state/agent.env     # chmod 600; keep it that way
 | `RIG_HISTORY` | `1` | set `0` to disable the SQLite turn log |
 | `RIG_LOG_LEVEL` | `INFO` | daemon log verbosity |
 | `CLAUDE_BIN` | `claude` | path to the CLI, if not on `PATH` |
+| `INJECT_POLL` | `5` | seconds between inject spool sweeps |
+| `WAKE_POLL` | `20` | seconds between wake scheduler sweeps |
+| `WAKE_MAX_LATE` | `43200` | a wake later than this (12h) is dropped, not fired |
 
 Read by `bin/rig` rather than the daemon, so set them in the environment, not
 this file: `RIG_ROOT` (default `/opt/agent-rig`), `RIG_USER`, `RIG_GROUP`,
@@ -133,21 +137,33 @@ tells you which.
 ## 5. Install and start
 
 ```bash
-/opt/agent-rig/brain/bin/rig venv          # .venv + discord.py
-sudo /opt/agent-rig/brain/bin/rig install  # service + hourly backup
-sudo /opt/agent-rig/brain/bin/rig start
+/opt/agent-rig/brain/bin/rig venv     # .venv + discord.py
+/opt/agent-rig/brain/bin/rig install  # service + hourly backup
+/opt/agent-rig/brain/bin/rig start
 /opt/agent-rig/brain/bin/rig logs
 ```
+
+**No `sudo` on macOS** — these are your own LaunchAgents, and `rig install`
+refuses if you try. On Linux they are system units and do need `sudo`.
 
 `rig doctor` checks the whole install if anything looks wrong. `rig run` runs it
 in the foreground, which is what you want while changing code.
 
-On macOS this is a **system-domain LaunchDaemon**, so it comes back after a
-reboot without anyone logging in.
+### Why a LaunchAgent and not a LaunchDaemon (macOS)
 
-**launchd will not run this with the lid shut.** For a laptop, pair it with
-`caffeinate -is` or set Energy Saver to prevent sleep on power. That constraint
-is the honest reason Phase 4 moves this to a Linux box.
+Claude Code keeps its OAuth credentials in the login keychain, and a
+system-domain job has no user session to unlock one — every turn dies with
+`Not logged in · Please run /login`, even when the job is configured to run as
+you. A LaunchAgent in `gui/<uid>` runs inside your session and can read the
+keychain. This is the same constraint that rules out a dedicated non-GUI rig
+user on this platform.
+
+The cost: it starts at **login**, not at boot. A reboot needs someone to log in.
+
+**launchd will not run this with the lid shut**, either. For a laptop, pair it
+with `caffeinate -is` or `sudo pmset -c disablesleep 1`. Both constraints
+disappear on Linux, where systemd has no keychain and a real system service
+works — which is the honest reason to move the rig to a box eventually.
 
 ---
 
@@ -158,13 +174,46 @@ Post in any channel in the guild. The first message registers it, creates
 starts a session. Every later message resumes it.
 
 ```
-!ping             daemon uptime and load
-!ctx              session id, model, transcript size, compaction state
-!model [alias]    show or switch model
-!reset            new session id — fresh context, same workdir
-!compact          compact this session
-!abort            kill the turn running in this channel
+!ping                    daemon uptime and load
+!ctx                     session id, model, transcript size, compaction state
+!model [alias]           show or switch model
+!reset                   new session id — fresh context, same workdir
+!compact                 compact this session
+!abort                   kill the turn running in this channel
+!wake in 2h <text>       book a future turn in this channel
+!wake at 18:30 <text>    same, at a clock time
+!wake list | cancel <id> see and cancel pending wakes
 ```
+
+## Waking an agent from outside Discord
+
+Two verbs, both plain files on disk — a producer needs nothing but a filesystem.
+
+**Now**, from cron, a git hook, or any script:
+
+```bash
+skills/inject/inject.py --channel general --text "morning brief" --label cron
+```
+
+**Later**, from a terminal or from an agent that needs to continue its own work:
+
+```bash
+skills/wake/wake.py add --in 20m --channel general --prompt "check the build"
+```
+
+`--label` is what the agent sees as the speaker, so it can tell an automated
+ping from a human one. A wake fires *through* inject, so both land in the same
+place.
+
+Wakes survive restarts (`jobs.json` is on disk) and sleep. A wake that came due
+while the laptop was closed fires on wake with its text prefixed
+`(late by 3h)`; past `WAKE_MAX_LATE` it is dropped rather than acted on stale.
+
+> **The spool is an unauthenticated path to running turns.** Anything that can
+> write to `/opt/agent-rig/inject/` gets a turn with
+> `--dangerously-skip-permissions` and no allowlist check — that gate only
+> covers messages arriving over Discord. The directory is `0700`, and every
+> injected turn posts a visible `📥` line so nothing runs silently.
 
 Three things worth knowing:
 
@@ -182,7 +231,7 @@ Three things worth knowing:
 
 ```bash
 cd /opt/agent-rig/brain
-.venv/bin/python tests/test_rig.py    # 74 offline checks, no Discord, no tokens
+.venv/bin/python tests/test_rig.py    # 129 offline checks, no Discord, no tokens
 bin/rig doctor
 ```
 

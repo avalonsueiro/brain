@@ -15,8 +15,10 @@ import json
 import os
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -28,8 +30,13 @@ os.environ["HOME"] = str(TMP / "home")
 os.environ.setdefault("DEFAULT_MODEL", "opus")
 (TMP / "home").mkdir(parents=True, exist_ok=True)
 
-from daemon import config, harness as harness_mod, state as state_mod  # noqa: E402
+from daemon import config, harness as harness_mod, spool as spool_mod, state as state_mod  # noqa: E402
 from daemon.ticker import split_message  # noqa: E402
+
+wake_mod = spool_mod.wake_mod
+# The wake module snapshots RIG_ROOT at import time; point it at the sandbox.
+wake_mod.JOBS_FILE = config.JOBS_FILE
+wake_mod.INJECT_DIR = config.INJECT_DIR
 
 PASS = FAIL = 0
 
@@ -373,6 +380,261 @@ def test_classifiers_ignore_model_prose() -> None:
     check("session id untouched", st.get(920)["session_id"] == sid)
 
 
+def test_wake_parsing() -> None:
+    print("\nwake: duration and clock-time parsing")
+    check("45s", wake_mod.parse_duration("45s") == 45)
+    check("20m", wake_mod.parse_duration("20m") == 1200)
+    check("2h", wake_mod.parse_duration("2h") == 7200)
+    check("3d", wake_mod.parse_duration("3d") == 259200)
+    check("1h30m compounds", wake_mod.parse_duration("1h30m") == 5400)
+    check("whitespace tolerated", wake_mod.parse_duration(" 2 h ") == 7200)
+
+    # Strict on purpose: a typo silently read as a partial duration is a wake
+    # that fires at the wrong time and looks like the scheduler's fault.
+    for bad in ("2huor", "", "abc", "20", "h", "-5m"):
+        try:
+            wake_mod.parse_duration(bad)
+            check(f"rejects {bad!r}", False, "parsed instead of raising")
+        except ValueError:
+            check(f"rejects {bad!r}", True)
+
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    zone = ZoneInfo(wake_mod.TZ)
+    noon = datetime(2026, 6, 15, 12, 0, tzinfo=zone)
+
+    at = wake_mod.parse_at("18:30", now=noon)
+    check("18:30 from noon is today", datetime.fromtimestamp(at, zone).day == 15)
+    check("18:30 lands at 18:30", datetime.fromtimestamp(at, zone).hour == 18)
+
+    # The rollover is the point: asking for 08:00 at noon means tomorrow.
+    at = wake_mod.parse_at("08:00", now=noon)
+    check("08:00 from noon rolls to tomorrow", datetime.fromtimestamp(at, zone).day == 16)
+
+    check("6:30pm parses", datetime.fromtimestamp(wake_mod.parse_at("6:30pm", now=noon), zone).hour == 18)
+    at = wake_mod.parse_at("2026-09-20 18:30", now=noon)
+    check("absolute date parses", datetime.fromtimestamp(at, zone).strftime("%Y-%m-%d %H:%M")
+          == "2026-09-20 18:30")
+    for bad in ("tomorrow", "25:00", ""):
+        try:
+            wake_mod.parse_at(bad, now=noon)
+            check(f"rejects {bad!r}", False, "parsed instead of raising")
+        except ValueError:
+            check(f"rejects {bad!r}", True)
+
+    check("human_delta rounds, not truncates", wake_mod.human_delta(7199.9) == "2h",
+          wake_mod.human_delta(7199.9))
+
+
+def test_wake_jobs() -> None:
+    print("\nwake: jobs.json")
+    config.ensure_dirs()
+    config.JOBS_FILE.unlink(missing_ok=True)
+    now = int(time.time())
+
+    a = wake_mod.add("general", "later", now + 3600)
+    b = wake_mod.add("general", "sooner", now + 60)
+    check("ids are unique", a["id"] != b["id"])
+    check("stored sorted by time", [j["prompt"] for j in wake_mod.listing()] == ["sooner", "later"])
+    check("listing filters by channel", wake_mod.listing("nope") == [])
+
+    check("cancel returns the job", wake_mod.cancel(a["id"])["prompt"] == "later")
+    check("cancel removes it", [j["id"] for j in wake_mod.listing()] == [b["id"]])
+    check("cancel of a missing id is None", wake_mod.cancel("zzzz") is None)
+
+    print("\nwake: due selection")
+    config.JOBS_FILE.unlink(missing_ok=True)
+    wake_mod.add("general", "past", now - 30)
+    wake_mod.add("general", "exactly now", now)
+    wake_mod.add("general", "future", now + 3600)
+    due = wake_mod.take_due(now)
+    check("past and exactly-now fire", sorted(j["prompt"] for j in due) == ["exactly now", "past"])
+    check("future is left alone", [j["prompt"] for j in wake_mod.listing()] == ["future"])
+    check("take_due is idempotent", wake_mod.take_due(now) == [])
+
+
+def test_wake_concurrent_writers() -> None:
+    print("\nwake: two processes writing jobs.json at once (the flock case)")
+    config.ensure_dirs()
+    config.JOBS_FILE.unlink(missing_ok=True)
+
+    # Real subprocesses, not threads -- flock is a kernel lock between
+    # processes, and a threaded test would pass even without it.
+    script = TMP / "adder.py"
+    script.write_text(
+        "import sys, time\n"
+        f"sys.path.insert(0, {str(ROOT / 'skills' / 'wake')!r})\n"
+        "import wake\n"
+        f"wake.JOBS_FILE = __import__('pathlib').Path({str(config.JOBS_FILE)!r})\n"
+        "wake.add('general', sys.argv[1], int(time.time()) + 3600)\n",
+        encoding="utf-8",
+    )
+    procs = [
+        subprocess.Popen([sys.executable, str(script), f"job{i}"])
+        for i in range(12)
+    ]
+    for p in procs:
+        p.wait()
+
+    jobs = wake_mod.listing()
+    check("all 12 concurrent writes survived", len(jobs) == 12, f"got {len(jobs)}")
+    check("no id collisions", len({j["id"] for j in jobs}) == len(jobs))
+    check("file is still valid JSON", isinstance(json.loads(config.JOBS_FILE.read_text()), list))
+
+
+class _FakeChannel:
+    def __init__(self, cid: int, name: str) -> None:
+        self.id, self.name, self.sent = cid, name, []
+
+    async def send(self, content):
+        self.sent.append(content)
+
+
+class _FakeBot:
+    """Just enough surface for Spool: a guild that resolves channels, a queue."""
+
+    def __init__(self, cfg, st, channels) -> None:
+        self.cfg, self.state, self.draining = cfg, st, False
+        self.channels = channels
+        self.queued: list[dict] = []
+
+    def get_guild(self, gid):
+        return self if gid == self.cfg.guild_id else None
+
+    @property
+    def text_channels(self):
+        return list(self.channels.values())
+
+    def get_channel(self, cid):
+        return self.channels.get(cid)
+
+    def _queue_for(self, cid):
+        bot = self
+
+        class _Q:
+            def put_nowait(self, item):
+                bot.queued.append(item)
+
+        return _Q()
+
+
+def _spool_fixture():
+    config.ensure_dirs()
+    for leftover in config.INJECT_DIR.iterdir():
+        leftover.unlink()
+    os.environ.update({"DISCORD_BOT_TOKEN": "x", "DISCORD_GUILD_ID": "7",
+                       "DISCORD_ALLOWED_USER_IDS": "42"})
+    cfg = config.Config()
+    st = fresh_state()
+    channel = _FakeChannel(555, "general")
+    bot = _FakeBot(cfg, st, {555: channel})
+    return spool_mod.Spool(bot), bot, channel
+
+
+def test_inject_spool() -> None:
+    print("\ninject: spool lifecycle")
+    spool, bot, channel = _spool_fixture()
+
+    spool_mod.write_inject("general", "hello there", "cron")
+    asyncio.run(spool._drain_inject_dir())
+    check("file consumed", list(config.INJECT_DIR.glob("*.json")) == [])
+    check("posted to the channel", any("hello there" in s for s in channel.sent), str(channel.sent))
+    check("turn enqueued", len(bot.queued) == 1, str(bot.queued))
+    check("label becomes the speaker", bot.queued[0]["author"] == "cron")
+    check("text preserved", bot.queued[0]["text"] == "hello there")
+    check("channel registered in state", bot.state.get(555) is not None)
+
+    print("\ninject: resolution by id")
+    spool_mod.write_inject("555", "by numeric id", "test")
+    asyncio.run(spool._drain_inject_dir())
+    check("numeric channel id resolves", bot.queued[-1]["text"] == "by numeric id")
+
+    print("\ninject: failure modes")
+    bad = config.INJECT_DIR / "9-bad.json"
+    bad.write_text("{not json", encoding="utf-8")
+    asyncio.run(spool._drain_inject_dir())
+    check("bad JSON renamed .failed", (config.INJECT_DIR / "9-bad.json.failed").exists())
+
+    spool_mod.write_inject("does-not-exist", "nowhere", "test")
+    asyncio.run(spool._drain_inject_dir())
+    # Load-bearing: Phase 4's collab confirms delivery by watching for this.
+    check("unresolvable channel renamed .failed",
+          len(list(config.INJECT_DIR.glob("*.json.failed"))) == 2)
+
+    missing = config.INJECT_DIR / "9-empty.json"
+    missing.write_text(json.dumps({"channel": "general"}), encoding="utf-8")
+    asyncio.run(spool._drain_inject_dir())
+    check("missing text renamed .failed", (config.INJECT_DIR / "9-empty.json.failed").exists())
+
+    print("\ninject: half-written files and ordering")
+    for f in config.INJECT_DIR.glob("*.failed"):
+        f.unlink()
+    (config.INJECT_DIR / "1-partial.json.tmp").write_text('{"channel":"gen', encoding="utf-8")
+    before = len(bot.queued)
+    asyncio.run(spool._drain_inject_dir())
+    check(".tmp is never read", len(bot.queued) == before)
+    check(".tmp left in place", (config.INJECT_DIR / "1-partial.json.tmp").exists())
+    (config.INJECT_DIR / "1-partial.json.tmp").unlink()
+
+    for i, word in enumerate(["first", "second", "third"]):
+        (config.INJECT_DIR / f"{1000 + i}-x.json").write_text(
+            json.dumps({"channel": "general", "text": word, "label": "t"}), encoding="utf-8"
+        )
+    bot.queued.clear()
+    asyncio.run(spool._drain_inject_dir())
+    check("spool is FIFO by filename",
+          [q["text"] for q in bot.queued] == ["first", "second", "third"],
+          str([q["text"] for q in bot.queued]))
+
+
+def test_wake_firing() -> None:
+    print("\nwake: firing, lateness, and the drop cap")
+    spool, bot, channel = _spool_fixture()
+    config.JOBS_FILE.unlink(missing_ok=True)
+    now = int(time.time())
+
+    wake_mod.add("general", "on time", now - 5)
+    wake_mod.add("general", "not yet", now + 3600)
+    spool._fire_due()
+    files = sorted(config.INJECT_DIR.glob("*.json"))
+    check("due job wrote one inject file", len(files) == 1, str(files))
+    payload = json.loads(files[0].read_text())
+    check("no late prefix when on time", payload["text"] == "on time", payload["text"])
+    check("label defaults to wake", payload["label"] == "wake")
+    check("future job untouched", [j["prompt"] for j in wake_mod.listing()] == ["not yet"])
+
+    for f in config.INJECT_DIR.glob("*.json"):
+        f.unlink()
+    config.JOBS_FILE.unlink(missing_ok=True)
+
+    # The case that matters on a laptop: it slept through the scheduled time.
+    wake_mod.add("general", "slept through this", now - 3 * 3600)
+    spool._fire_due()
+    payload = json.loads(next(config.INJECT_DIR.glob("*.json")).read_text())
+    check("late job fires", "slept through this" in payload["text"])
+    check("late job is labelled late", payload["text"].startswith("(late by 3h)"), payload["text"])
+
+    for f in config.INJECT_DIR.glob("*.json"):
+        f.unlink()
+    config.JOBS_FILE.unlink(missing_ok=True)
+
+    wake_mod.add("general", "stale", now - 13 * 3600)
+    spool._fire_due()
+    check("past WAKE_MAX_LATE is dropped, not fired",
+          list(config.INJECT_DIR.glob("*.json")) == [])
+    check("dropped job is removed from jobs.json", wake_mod.listing() == [])
+
+    print("\nwake: survives a daemon restart")
+    config.JOBS_FILE.unlink(missing_ok=True)
+    wake_mod.add("general", "after restart", now + 1)
+    reloaded = spool_mod.Spool(bot)          # a fresh Spool, as on restart
+    time.sleep(1.1)
+    reloaded._fire_due()
+    check("job booked before the restart still fires",
+          any("after restart" in json.loads(f.read_text())["text"]
+              for f in config.INJECT_DIR.glob("*.json")))
+
+
 def test_compaction_detection() -> None:
     print("\ncompaction detection")
     st = fresh_state()
@@ -440,6 +702,11 @@ def main() -> int:
         test_model_fallback()
         test_missing_transcript()
         test_timeout()
+        test_wake_parsing()
+        test_wake_jobs()
+        test_wake_concurrent_writers()
+        test_inject_spool()
+        test_wake_firing()
         test_large_events()
         test_partial_answer_is_an_error()
         test_classifiers_ignore_model_prose()

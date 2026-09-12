@@ -17,7 +17,7 @@ import time
 
 import discord
 
-from . import commands, config, harness as harness_mod, state as state_mod
+from . import commands, config, harness as harness_mod, spool as spool_mod, state as state_mod
 from .ticker import Ticker
 
 log = logging.getLogger("rig.bot")
@@ -48,8 +48,17 @@ class RigBot(discord.Client):
         self.active_turns = 0
         self.draining = False
         self.started_at = time.time()
+        self.spool = spool_mod.Spool(self)
 
     # --- lifecycle ---------------------------------------------------------
+
+    async def setup_hook(self) -> None:
+        """Runs exactly once, before the first connection.
+
+        The spool loops belong here rather than in on_ready, which re-fires on
+        every gateway reconnect and would stack a duplicate poller each time.
+        """
+        self.spool.start()
 
     async def on_ready(self) -> None:
         log.info("connected as %s", self.user)
@@ -75,6 +84,9 @@ class RigBot(discord.Client):
         systemd gets `KillMode=mixed`; this is the same contract on macOS.
         """
         self.draining = True
+        # Stop pulling new work off the spool. Anything already enqueued is
+        # counted below and still gets answered.
+        self.spool.stop()
 
         def outstanding() -> int:
             # Queued-but-unstarted counts too: a worker between turns has

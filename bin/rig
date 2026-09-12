@@ -101,10 +101,12 @@ cmd_bootstrap() {
   fi
 
   info "creating $RIG_ROOT"
-  mkdir -p "$RIG_ROOT"/{workdirs,state/{logs,backups}}
+  mkdir -p "$RIG_ROOT"/{inject,workdirs,state/{logs,backups}}
   chown -R "$RIG_USER:$(rig_group)" "$RIG_ROOT"
   chmod -R g+rwX "$RIG_ROOT"
   find "$RIG_ROOT" -type d -exec chmod g+s {} +   # new files inherit the group
+  # The spool is an unauthenticated path to running turns -- keep it private.
+  chmod 700 "$RIG_ROOT/inject"
 
   if [ ! -f "$STATE_DIR/agent.env" ]; then
     install -o "$RIG_USER" -g "$(rig_group)" -m 600 /dev/null "$STATE_DIR/agent.env"
@@ -288,7 +290,7 @@ cmd_backup() {
   STAGE="$(mktemp -d)"
   mkdir -p "$STAGE/state" "$STAGE/transcripts"
 
-  for f in state.json agent.env; do
+  for f in state.json jobs.json agent.env; do
     [ -e "$STATE_DIR/$f" ] && cp -a "$STATE_DIR/$f" "$STAGE/state/" || true
   done
   # sqlite3 .backup, not cp: the daemon writes this DB continuously, and copying
@@ -379,6 +381,8 @@ cmd_doctor() {
   chk "$STATE_DIR writable"            "[ -w '$STATE_DIR' ]"
   chk "agent.env exists"               "[ -f '$STATE_DIR/agent.env' ]"
   chk "agent.env is 0600"              "[ \"\$(stat -f %Lp '$STATE_DIR/agent.env' 2>/dev/null || stat -c %a '$STATE_DIR/agent.env')\" = 600 ]"
+  chk "inject/ exists"                 "[ -d '$RIG_ROOT/inject' ]"
+  chk "inject/ is 0700"                "[ \"\$(stat -f %Lp '$RIG_ROOT/inject' 2>/dev/null || stat -c %a '$RIG_ROOT/inject')\" = 700 ]"
   chk "DISCORD_BOT_TOKEN set"          "grep -q '^DISCORD_BOT_TOKEN=.\\+' '$STATE_DIR/agent.env'"
   chk "DISCORD_ALLOWED_USER_IDS set"   "grep -q '^DISCORD_ALLOWED_USER_IDS=.\\+' '$STATE_DIR/agent.env'"
   chk "cleanupPeriodDays >= 365"       "'$PY' -c \"import json,os,sys; p=os.path.expanduser('~/.claude/settings.json'); sys.exit(0 if json.load(open(p)).get('cleanupPeriodDays',30)>=365 else 1)\""

@@ -11,13 +11,26 @@ from . import config, harness as harness_mod, state as state_mod
 log = logging.getLogger("rig.commands")
 
 HELP = """```
-!ping             daemon uptime and load
-!ctx              this channel's session, model, transcript size
-!model [alias]    show or switch model (opus, fable, sonnet, haiku)
-!reset            new session id -- fresh context, same workdir
-!compact          compact this session's context
-!abort            kill the turn running in this channel
+!ping                    daemon uptime and load
+!ctx                     this channel's session, model, transcript size
+!model [alias]           show or switch model (opus, fable, sonnet, haiku)
+!reset                   new session id -- fresh context, same workdir
+!compact                 compact this session's context
+!abort                   kill the turn running in this channel
+!wake in 2h <text>       book a future turn in this channel
+!wake at 18:30 <text>    same, at a clock time
+!wake list | cancel <id>
 ```"""
+
+WAKE_HELP = (
+    "usage:\n"
+    "```\n"
+    "!wake in 2h check the deploy\n"
+    "!wake at 18:30 stand up\n"
+    "!wake list\n"
+    "!wake cancel w7k2\n"
+    "```"
+)
 
 
 def _human(n: int) -> str:
@@ -153,4 +166,75 @@ async def handle(bot, message, content: str) -> None:
         await channel.send("🗜️ compaction queued.")
         return
 
+    if cmd == "wake":
+        await _wake(bot, channel, rec, args)
+        return
+
     await channel.send(f"unknown command `!{cmd}`\n{HELP}")
+
+
+async def _wake(bot, channel, rec, args: list[str]) -> None:
+    """`!wake` — the same parsing and the same jobs.json the CLI uses.
+
+    Imported from skills/wake rather than reimplemented, so a fix to duration
+    parsing lands in both places at once.
+    """
+    from .spool import wake_mod
+
+    if not args:
+        await channel.send(WAKE_HELP)
+        return
+
+    sub = args[0].lower()
+
+    if sub == "list":
+        jobs = wake_mod.listing(rec["name"])
+        if not jobs:
+            await channel.send("no wake jobs pending for this channel.")
+            return
+        now = time.time()
+        lines = []
+        for job in jobs:
+            delta = job["at"] - now
+            when = (
+                f"in {wake_mod.human_delta(delta)}"
+                if delta >= 0
+                else f"{wake_mod.human_delta(delta)} LATE"
+            )
+            lines.append(
+                f"{job['id']}  {wake_mod.local(job['at'])}  ({when})  {job['prompt'][:70]}"
+            )
+        await channel.send("```\n" + "\n".join(lines) + "\n```")
+        return
+
+    if sub == "cancel":
+        if len(args) < 2:
+            await channel.send("which one? `!wake cancel <id>` — `!wake list` shows ids.")
+            return
+        removed = wake_mod.cancel(args[1])
+        if removed is None:
+            await channel.send(f"no wake job `{args[1]}`.")
+        else:
+            await channel.send(f"🗑️ cancelled `{args[1]}` ({wake_mod.local(removed['at'])})")
+        return
+
+    if sub not in ("in", "at") or len(args) < 3:
+        await channel.send(WAKE_HELP)
+        return
+
+    when_arg, prompt = args[1], " ".join(args[2:]).strip()
+    try:
+        at = (
+            int(time.time()) + wake_mod.parse_duration(when_arg)
+            if sub == "in"
+            else wake_mod.parse_at(when_arg)
+        )
+    except ValueError as exc:
+        await channel.send(f"⚠️ {exc}")
+        return
+
+    job = wake_mod.add(rec["name"], prompt, at, label="wake")
+    await channel.send(
+        f"⏰ `{job['id']}` — {wake_mod.local(at)} "
+        f"(in {wake_mod.human_delta(at - time.time())})"
+    )

@@ -46,10 +46,13 @@ daemon/
   ticker.py    the live-editing message and Discord-safe splitting
   commands.py  ! commands
   history.py   SQLite WAL + FTS5 log of every turn
+  spool.py     inject poller + wake scheduler
+skills/wake/   book a future turn (agent- and human-callable)
+skills/inject/ start a turn from cron, a git hook, anything
 bin/rig        bootstrap · venv · install · start/stop · logs · backup · doctor
 infra/         launchd plists (macOS) and systemd units (Linux)
 templates/     the CLAUDE.md seeded into every channel workdir
-tests/         74 offline checks — no Discord, no tokens
+tests/         129 offline checks — no Discord, no tokens
 ```
 
 ## Two settings that will bite you
@@ -78,10 +81,21 @@ operator:
 
 ```
 !ping   !ctx   !model [alias]   !reset   !compact   !abort
+!wake in 2h <text>   !wake at 18:30 <text>   !wake list   !wake cancel <id>
 ```
+
+## Waking an agent
+
+A turn can start without you. `skills/inject/inject.py` drops a JSON file and a
+turn runs; `skills/wake/wake.py` books one for later and fires it through the
+same path. Both are plain files on disk, so cron, a git hook, or an agent
+continuing its own work all use the same seam.
+
+The second one is the real unlock: a session cannot stay resident, so an agent
+that needs to check back in twenty minutes books a wake and exits.
 
 ## Status
 
-Phase 1 (daemon + session-per-message loop) is built. Later phases — the
-inject/wake spool, the memory graph, the agent fleet, ticket→PR, the automation
-layer — are deliberately not started until this has survived a week of real use.
+Phases 1 and 2 are built: the daemon and session-per-message loop, plus the
+inject spool and wake scheduler. Later phases — the memory graph, the agent
+fleet, ticket→PR, the automation layer — are deliberately not started yet.

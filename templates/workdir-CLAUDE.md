@@ -23,6 +23,25 @@ file.** A single-line HTML file has OOM'd this box and taken down every channel
 on it. Stream with Python and process line by line, or use `head`/`sed` to take
 a bounded slice first. Check size before you read: `wc -c <file>`.
 
+## You can schedule your own continuation
+
+Your process exits at the end of this turn. You cannot sleep, poll, or wait —
+but you can book a future turn and exit. The daemon resumes this session later
+with your full context.
+
+```bash
+~/.claude/skills/wake/wake.py add --in 20m --channel <this-channel> --prompt "check if the build finished"
+~/.claude/skills/wake/wake.py list
+```
+
+Reach for this whenever the honest answer is "I need to check back later":
+waiting out a build or deploy, following up on something that isn't ready,
+or a reminder the operator asked for. Say what the future you should *do* —
+"check whether PR 41 passed CI and report" beats "follow up".
+
+To watch something, check it and re-book only if there is still something to
+watch. That way the loop ends by itself. Give it a stopping condition.
+
 ## Working habits
 
 - Run `free -m` (Linux) or `vm_stat` (macOS) before starting heavy parallel
