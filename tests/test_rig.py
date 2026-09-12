@@ -14,6 +14,7 @@ import asyncio
 import json
 import os
 import shutil
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -1098,6 +1099,264 @@ def test_backup_reports_a_degraded_archive() -> None:
           out.stderr)
 
 
+# --- the memory graph -------------------------------------------------------
+
+sys.path.insert(0, str(ROOT / "skills" / "graph"))
+import graph as graph_mod  # noqa: E402
+
+
+def fresh_graph():
+    config.ensure_dirs()
+    for suffix in ("", "-wal", "-shm"):
+        Path(str(config.GRAPH_DB) + suffix).unlink(missing_ok=True)
+    return graph_mod.Graph(config.GRAPH_DB)
+
+
+def test_graph_dedup() -> None:
+    print("\ngraph: dedup is the whole game")
+    g = fresh_graph()
+    # A graph that stores these as three people is worse than no graph.
+    first, created = g.upsert_node("Akeil", "Person", ["Akeil M"])
+    check("first upsert creates", created)
+    second, created = g.upsert_node("akeil m.", "Person")
+    check("punctuation and case collapse to the same node", second == first)
+    check("and it reports a match, not a create", created is False)
+    third, created = g.upsert_node("Akeil Mohammed", "Person")
+    check("an unseen form is a different node", third != first)
+    g.merge("Akeil Mohammed", "Akeil")
+    check("after merge it resolves to the survivor", g.resolve("Akeil Mohammed") == first)
+
+    check("normalize collapses punctuation",
+          graph_mod.normalize("A. Sueiro!") == graph_mod.normalize("a sueiro"))
+    g.close()
+
+
+def test_graph_edges_and_path() -> None:
+    print("\ngraph: edges and connections")
+    g = fresh_graph()
+    for name, type_ in (("Akeil", "Person"), ("Avalon", "Person"),
+                        ("outlate", "Project"), ("Discord", "Tool")):
+        g.upsert_node(name, type_)
+    g.link("Akeil", "co-founder-of", "outlate")
+    g.link("Avalon", "co-founder-of", "outlate")
+    g.link("Akeil", "colleague-of", "Avalon", symmetric=True)
+
+    check("duplicate links are not duplicated",
+          g.link("Akeil", "co-founder-of", "outlate")
+          == g.link("Akeil", "co-founder-of", "outlate"))
+
+    akeil = g.resolve("Akeil")
+    rels = {(n["rel"], n["other"]) for n in g.neighbors(akeil)}
+    check("outbound edge is visible", ("co-founder-of", "outlate") in rels)
+    avalon_side = {(n["rel"], n["dir"]) for n in g.neighbors(g.resolve("Avalon"))}
+    check("a symmetric edge reads the same from the other end",
+          ("colleague-of", "<->") in avalon_side, str(avalon_side))
+
+    check("path finds a 2-hop connection",
+          g.path("Akeil", "outlate") == ["Akeil", "outlate"])
+    trail = g.path("outlate", "Discord")
+    check("path returns None when nothing connects", trail is None, str(trail))
+    check("path to self is trivial", g.path("Akeil", "Akeil") == ["Akeil"])
+    g.close()
+
+
+def test_graph_observations_and_query() -> None:
+    print("\ngraph: observations and search")
+    g = fresh_graph()
+    g.upsert_node("Akeil", "Person", ["Akeil M"], notes="co-founder, async-first")
+    g.upsert_node("outlate", "Project")
+    g.observe("Akeil", "prefers async updates over calls", source="discord/#general")
+    g.observe("Akeil", "signed off on the pricing change")
+
+    obs = g.observations(g.resolve("Akeil"))
+    check("observations are stored newest first", len(obs) == 2)
+    check("source is retained", any(o["source"] == "discord/#general" for o in obs))
+
+    names = lambda text: {r["name"] for r in g.query(text)}
+    check("query matches a name", "Akeil" in names("Akeil"))
+    check("query matches an alias", "Akeil" in names("Akeil M"))
+    check("query matches note text", "Akeil" in names("async-first"))
+    check("query matches observation text", "Akeil" in names("pricing"))
+    check("query on a miss returns nothing", names("nonexistent-term") == set())
+
+    profile = g.profile("Akeil M")          # by alias
+    check("profile resolves by alias", profile.startswith("# Akeil"))
+    check("profile carries observations", "pricing change" in profile)
+    g.close()
+
+
+def test_graph_repair() -> None:
+    print("\ngraph: forget, rename, merge")
+    g = fresh_graph()
+    g.upsert_node("Wrong Fact", "Fact")
+    g.forget("Wrong Fact")
+    check("a forgotten node stops surfacing in query",
+          g.query("Wrong Fact") == [])
+    # Tombstone, not delete: the record of having believed it is what you need
+    # when you go looking for how the mistake happened.
+    check("but it still exists on disk", g.resolve("Wrong Fact") is not None)
+    check("and its status says so", g.node(g.resolve("Wrong Fact"))["status"] == "forgotten")
+    g.upsert_node("Wrong Fact", "Fact")
+    check("re-upserting revives it", g.node(g.resolve("Wrong Fact"))["status"] == "active")
+
+    g.upsert_node("outlate", "Project")
+    g.rename("outlate", "Outlate")
+    check("rename keeps the old name resolving", g.resolve("outlate") is not None)
+    check("and the new one works too", g.resolve("Outlate") == g.resolve("outlate"))
+
+    # A merge must not leave edges or observations pointing at the loser.
+    g.upsert_node("Akeil", "Person")
+    g.upsert_node("Akeil Mohammed", "Person")
+    g.link("Akeil Mohammed", "co-founder-of", "Outlate")
+    g.observe("Akeil Mohammed", "an observation on the duplicate")
+    loser = g.resolve("Akeil Mohammed")
+    winner = g.merge("Akeil Mohammed", "Akeil")
+    check("merge returns the survivor", winner == g.resolve("Akeil"))
+    orphan_edges = g.db.execute(
+        "SELECT COUNT(*) FROM edges WHERE src=? OR dst=?", (loser, loser)).fetchone()[0]
+    check("no edges left pointing at the loser", orphan_edges == 0)
+    orphan_obs = g.db.execute(
+        "SELECT COUNT(*) FROM observations WHERE node_id=?", (loser,)).fetchone()[0]
+    check("no observations left on the loser", orphan_obs == 0)
+    check("the observation moved to the survivor",
+          any("duplicate" in o["content"] for o in g.observations(winner)))
+    check("no self-edges were created by the merge",
+          g.db.execute("SELECT COUNT(*) FROM edges WHERE src=dst").fetchone()[0] == 0)
+    g.close()
+
+
+def test_graph_concurrent_writers() -> None:
+    print("\ngraph: two processes writing at once (the WAL case)")
+    g = fresh_graph()
+    g.close()
+    script = TMP / "grapher.py"
+    script.write_text(
+        "import sys\n"
+        f"sys.path.insert(0, {str(ROOT / 'skills' / 'graph')!r})\n"
+        "import graph, pathlib\n"
+        f"g = graph.Graph(pathlib.Path({str(config.GRAPH_DB)!r}))\n"
+        "for i in range(10):\n"
+        "    g.upsert_node(f'{sys.argv[1]}-{i}', 'Fact')\n"
+        "g.close()\n",
+        encoding="utf-8",
+    )
+    procs = [subprocess.Popen([sys.executable, str(script), f"w{i}"]) for i in range(4)]
+    for p in procs:
+        p.wait(timeout=60)
+
+    g = graph_mod.Graph(config.GRAPH_DB)
+    check("every concurrent write landed", g.stats()["nodes"] == 40, str(g.stats()["nodes"]))
+    check("no writer was starved", all(p.returncode == 0 for p in procs))
+    g.close()
+
+
+# --- history writer + recall reader -----------------------------------------
+
+sys.path.insert(0, str(ROOT / "skills" / "recall"))
+import recall as recall_mod  # noqa: E402
+from daemon.history import History  # noqa: E402
+
+
+def _seeded_history():
+    """A real History, written through the real writer."""
+    config.ensure_dirs()
+    for suffix in ("", "-wal", "-shm"):
+        Path(str(config.HISTORY_DB) + suffix).unlink(missing_ok=True)
+    h = History(config.HISTORY_DB)
+    rec = {"name": "general", "session_id": "sess-1"}
+    h.log_inbound(555, "general", rec, "avalon", "remember the number 47")
+    h.log_outbound(555, rec, harness_mod.TurnResult(
+        text="Noted: 47.", output_tokens=12, tools=["Bash(date)"]))
+    h.log_inbound(555, "general", rec, "avalon", "how is the deploy going")
+    h.log_outbound(555, rec, harness_mod.TurnResult(
+        text="The deploy finished cleanly.", output_tokens=30))
+    h.log_outbound(555, rec, harness_mod.TurnResult(
+        text="it timed out", is_error=True, error_kind="timeout"))
+    other = {"name": "ops", "session_id": "sess-2"}
+    h.log_inbound(777, "ops", other, "avalon", "deploy notes for ops")
+    return h
+
+
+def test_history_writer() -> None:
+    print("\nhistory: the writer nothing was testing")
+    h = _seeded_history()
+    # _insert swallows sqlite3.Error and only logs, so a column/tuple mismatch
+    # would silently lose every turn in production while the suite stayed green.
+    rows = h.db.execute("SELECT * FROM turns ORDER BY id").fetchall()
+    check("every logged turn landed", len(rows) == 6, str(len(rows)))
+
+    first = dict(zip([c[0] for c in h.db.execute("SELECT * FROM turns LIMIT 1").description],
+                     rows[0]))
+    check("inbound columns line up with their values",
+          first["channel"] == "general" and first["author"] == "avalon"
+          and first["direction"] == "in" and first["text"] == "remember the number 47",
+          str(first))
+    check("channel_id is stored", first["channel_id"] == "555")
+    check("session_id is stored", first["session_id"] == "sess-1")
+
+    out = h.db.execute("SELECT * FROM turns WHERE direction='out' ORDER BY id").fetchall()
+    check("outbound records the answer text", out[0][9] == "Noted: 47.", str(out[0]))
+    check("outbound records tokens", out[0][10] == 12)
+    check("tool names are captured", out[0][8] == "Bash(date)")
+    check("a failed turn is kind='error'",
+          any(r[7] == "error" for r in out), str([r[7] for r in out]))
+
+    hits = h.db.execute(
+        "SELECT t.text FROM turns_fts f JOIN turns t ON t.id=f.rowid"
+        " WHERE turns_fts MATCH '47'").fetchall()
+    check("the FTS index actually returns rows", len(hits) >= 1, str(hits))
+    h.close()
+
+
+def test_recall_reader() -> None:
+    print("\nrecall: reading the log back")
+    h = _seeded_history()
+    h.close()
+    db = recall_mod.connect(config.HISTORY_DB)
+
+    hits = recall_mod.search(db, "deploy")
+    check("search finds matches across channels", len(hits) >= 2, str(len(hits)))
+    check("both channels are represented",
+          {r["channel"] for r in hits} == {"general", "ops"},
+          str({r["channel"] for r in hits}))
+
+    scoped = recall_mod.search(db, "deploy", channel="general")
+    check("--channel narrows it", {r["channel"] for r in scoped} == {"general"})
+    check("a leading # is tolerated",
+          len(recall_mod.search(db, "deploy", channel="#general")) == len(scoped))
+
+    check("--days excludes older turns",
+          recall_mod.search(db, "deploy", days=0) == []
+          or all(r["ts"] >= time.time() - 1 for r in recall_mod.search(db, "deploy", days=0)))
+    check("a miss returns nothing", recall_mod.search(db, "zzzznonexistent") == [])
+    # A malformed FTS query is a search miss, not a traceback.
+    check("an unparseable query degrades to LIKE",
+          isinstance(recall_mod.search(db, 'AND "'), list))
+
+    tail = recall_mod.channel_tail(db, "general", 3)
+    check("channel tail returns oldest-first", [r["id"] for r in tail] == sorted(r["id"] for r in tail))
+    check("channel tail respects the limit", len(tail) == 3)
+
+    middle = recall_mod.around(db, 3, context=1)
+    check("around returns the turn plus context", len(middle) == 3, str(len(middle)))
+    check("the requested turn is in the middle", middle[1]["id"] == 3)
+    check("around a missing id is empty", recall_mod.around(db, 9999) == [])
+    # Context must not bleed across channels.
+    check("around stays within one channel",
+          len({r["channel_id"] for r in recall_mod.around(db, 6, context=5)}) == 1)
+
+    check("the reader cannot write", _is_readonly(db))
+    db.close()
+
+
+def _is_readonly(db) -> bool:
+    try:
+        db.execute("INSERT INTO turns (channel, text) VALUES ('x','x')")
+        return False
+    except sqlite3.OperationalError:
+        return True
+
+
 def test_compaction_detection() -> None:
     print("\ncompaction detection")
     st = fresh_state()
@@ -1186,6 +1445,13 @@ def main() -> int:
         test_bash_transcript_encoding_parity()
         test_backup_restore_round_trip()
         test_backup_reports_a_degraded_archive()
+        test_graph_dedup()
+        test_graph_edges_and_path()
+        test_graph_observations_and_query()
+        test_graph_repair()
+        test_graph_concurrent_writers()
+        test_history_writer()
+        test_recall_reader()
         test_compaction_detection()
     finally:
         shutil.rmtree(TMP, ignore_errors=True)

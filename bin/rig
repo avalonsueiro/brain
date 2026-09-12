@@ -319,11 +319,18 @@ cmd_backup() {
   # sqlite3 .backup, not cp: the daemon writes this DB continuously, and copying
   # the .db/-wal/-shm trio file-by-file can capture three mutually inconsistent
   # snapshots -- a "successful" backup you discover is corrupt at restore time.
+  # sqlite3 .backup, not cp: these are live WAL databases, and copying the
+  # .db/-wal/-shm trio file-by-file can capture three mutually inconsistent
+  # snapshots -- a "successful" backup you discover is corrupt at restore time.
+  # graph.db matters most of all: transcripts can be re-read, a curated graph
+  # cannot be rebuilt from anything.
   local degraded=0
-  if [ -e "$STATE_DIR/history.db" ]; then
-    sqlite3 "$STATE_DIR/history.db" ".backup '$STAGE/state/history.db'" \
-      || { warn "history.db backup failed"; degraded=1; }
-  fi
+  for db in history.db graph.db; do
+    if [ -e "$STATE_DIR/$db" ]; then
+      sqlite3 "$STATE_DIR/$db" ".backup '$STAGE/state/$db'" \
+        || { warn "$db backup failed"; degraded=1; }
+    fi
+  done
 
   # Transcript dirs are named after the encoded cwd: / and . both become -.
   # Resolve the home directory from RIG_USER rather than $HOME: under `sudo rig
@@ -377,6 +384,29 @@ cmd_restore() {
 }
 
 # --- skills ----------------------------------------------------------------
+
+# _seed_workdir only writes CLAUDE.md when the file is absent, so a channel
+# created before a rule existed never learns it. Without this, the standing
+# instructions are only ever true for channels created after they were written.
+cmd_reseed() {
+  local template="$REPO_DIR/templates/workdir-CLAUDE.md"
+  [ -f "$template" ] || die "no template at $template"
+  local tz="${RIG_TZ:-America/New_York}"
+  local n=0
+  shopt -s nullglob
+  for dir in "$RIG_ROOT"/workdirs/*/; do
+    # Keep a copy of the old one: an operator may have hand-edited a channel's
+    # rules, and silently overwriting that is the kind of thing you notice a
+    # week later.
+    [ -f "$dir/CLAUDE.md" ] && cp "$dir/CLAUDE.md" "$dir/CLAUDE.md.bak"
+    sed "s|__RIG_TZ__|$tz|g" "$template" > "$dir/CLAUDE.md"
+    info "reseeded $(basename "$dir")"
+    n=$((n + 1))
+  done
+  shopt -u nullglob
+  info "$n workdir(s) reseeded; previous versions kept as CLAUDE.md.bak"
+  info "running channels pick this up on their next turn -- no restart needed"
+}
 
 cmd_link_skills() {
   local dst="$HOME/.claude/skills"
@@ -442,6 +472,7 @@ case "${1:-help}" in
   backup)      cmd_backup "$@" ;;
   restore)     cmd_restore "$@" ;;
   link-skills) cmd_link_skills "$@" ;;
+  reseed)      cmd_reseed "$@" ;;
   doctor)      cmd_doctor "$@" ;;
   *)
     cat <<EOF
@@ -458,6 +489,7 @@ usage: rig <command>
   backup        snapshot state + session transcripts
   restore <f>   restore from a backup archive
   link-skills   symlink repo skills into ~/.claude/skills
+  reseed        refresh every channel CLAUDE.md from the template
   doctor        check the install
 EOF
     ;;

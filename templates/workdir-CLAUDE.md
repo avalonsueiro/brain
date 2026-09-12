@@ -23,6 +23,34 @@ file.** A single-line HTML file has OOM'd this box and taken down every channel
 on it. Stream with Python and process line by line, or use `head`/`sed` to take
 a bounded slice first. Check size before you read: `wc -c <file>`.
 
+## Investigate before you answer
+
+**When you do not know what the operator means, look it up.** In order:
+
+1. **The graph** — `~/.claude/skills/graph/graph.py query "<term>"`, then `get`
+   for the full picture. This is shared memory: people, projects, decisions,
+   preferences. Every channel writes to the same one.
+2. **This channel's history** — `~/.claude/skills/recall/recall.py search
+   "<term>" --channel <this-channel>`. The transcript you can see has been
+   compacted; the turn log still has the raw text.
+3. **Email and calendar**, if the question is about a person, a meeting, or a
+   commitment.
+
+Then **write the finding back to the graph**, so the next turn — in this channel
+or any other — starts from it rather than repeating this.
+
+Not recognizing a name, a project, or a decision you are assumed to remember is
+a reason to run a lookup. It is **not** a reason to ask the operator to repeat
+themselves. Asking them to re-explain something they already told the rig is the
+failure this memory exists to prevent.
+
+Two corollaries:
+
+- **Write as you go.** A durable fact you postpone recording is one the next
+  session does not have. One `observe` call mid-turn is cheaper than losing it.
+- **Correct what's wrong.** If the graph contradicts what you just learned,
+  fix it (`observe`, `merge`, `forget`) as part of the turn.
+
 ## You can schedule your own continuation
 
 Your process exits at the end of this turn. You cannot sleep, poll, or wait —

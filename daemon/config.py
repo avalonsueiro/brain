@@ -33,6 +33,9 @@ INJECT_DIR = RIG_ROOT / "inject"
 ENV_FILE = STATE_DIR / "agent.env"
 STATE_FILE = STATE_DIR / "state.json"
 JOBS_FILE = STATE_DIR / "jobs.json"
+# The shared memory graph. Written by skills/graph/graph.py from inside turns,
+# never by the daemon -- it is here so backup and doctor know where to look.
+GRAPH_DB = STATE_DIR / "graph.db"
 HISTORY_DB = STATE_DIR / "history.db"
 BACKUP_DIR = STATE_DIR / "backups"
 LOG_DIR = STATE_DIR / "logs"
