@@ -1024,6 +1024,80 @@ def test_bash_transcript_encoding_parity() -> None:
               out == state_mod.encode_workdir(path), f"{out!r} != {state_mod.encode_workdir(path)!r}")
 
 
+def test_backup_restore_round_trip() -> None:
+    print("\nbin/rig: backup and restore actually round-trip")
+    # This is the recovery path the daemon's own missing-transcript error points
+    # the operator at ("Restore it from `rig backup`"), and it is the only
+    # protection against disk loss or a mistaken !reset. A broken restore is
+    # discovered at the exact moment it is already too late, so it gets a real
+    # round trip rather than trust.
+    st = fresh_state()
+    rec = st.register(970, "recovery")
+    transcript = touch_transcript(rec, '{"marker":"irreplaceable"}\n')
+    config.JOBS_FILE.unlink(missing_ok=True)
+    wake_mod.add(str(970), "a booked continuation", int(time.time()) + 9999)
+
+    env = {
+        **os.environ,
+        "RIG_ROOT": str(config.RIG_ROOT),
+        "RIG_HOME": os.environ["HOME"],
+        "PATH": os.environ.get("PATH", ""),
+    }
+    run_rig = lambda *a: subprocess.run(
+        ["bash", str(ROOT / "bin" / "rig"), *a], env=env, capture_output=True, text=True
+    )
+
+    out = run_rig("backup")
+    check("backup exits 0", out.returncode == 0, out.stdout + out.stderr)
+
+    archives = sorted((config.RIG_ROOT / "state" / "backups").glob("rig-*.tar.gz"))
+    check("an archive was written", len(archives) >= 1)
+    if not archives:
+        return
+    names = subprocess.run(
+        ["tar", "tzf", str(archives[-1])], capture_output=True, text=True
+    ).stdout
+    check("the archive contains state.json", "state/state.json" in names)
+    check("the archive contains jobs.json", "state/jobs.json" in names, names)
+    # The whole point: an archive with no transcripts is a backup of nothing.
+    check("the archive contains the session transcript",
+          transcript.name in names, names)
+
+    # Now destroy what the rig cannot rebuild, and get it back.
+    transcript.unlink()
+    config.STATE_FILE.unlink()
+    config.JOBS_FILE.unlink(missing_ok=True)
+
+    out = run_rig("restore", str(archives[-1]))
+    check("restore exits 0", out.returncode == 0, out.stdout + out.stderr)
+    check("the transcript is back", transcript.exists())
+    check("its contents survived intact",
+          "irreplaceable" in transcript.read_text() if transcript.exists() else False)
+    check("state.json is back", config.STATE_FILE.exists())
+    restored = state_mod.State()
+    check("the channel's session id survived",
+          (restored.get(970) or {}).get("session_id") == rec["session_id"])
+    check("the booked wake survived",
+          [j["prompt"] for j in wake_mod.listing()] == ["a booked continuation"])
+
+
+def test_backup_reports_a_degraded_archive() -> None:
+    print("\nbin/rig: an incomplete backup must not report success")
+    # An hourly job that exits 0 while archiving nothing is how you end up with
+    # months of empty backups and no idea.
+    empty = TMP / "empty-home"
+    (empty / ".claude" / "projects").mkdir(parents=True, exist_ok=True)
+    out = subprocess.run(
+        ["bash", str(ROOT / "bin" / "rig"), "backup"],
+        env={**os.environ, "RIG_ROOT": str(config.RIG_ROOT), "RIG_HOME": str(empty)},
+        capture_output=True, text=True,
+    )
+    check("exits nonzero when no transcripts were found", out.returncode != 0,
+          f"rc={out.returncode}")
+    check("and says why", "INCOMPLETE" in out.stderr or "no transcript" in out.stderr,
+          out.stderr)
+
+
 def test_compaction_detection() -> None:
     print("\ncompaction detection")
     st = fresh_state()
@@ -1110,6 +1184,8 @@ def main() -> int:
         test_exit_zero_without_result()
         test_child_env_has_no_secrets()
         test_bash_transcript_encoding_parity()
+        test_backup_restore_round_trip()
+        test_backup_reports_a_degraded_archive()
         test_compaction_detection()
     finally:
         shutil.rmtree(TMP, ignore_errors=True)

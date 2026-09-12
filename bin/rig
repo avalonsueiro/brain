@@ -46,7 +46,9 @@ user_home() {
     getent passwd "$1" | cut -d: -f6
   fi
 }
-RIG_HOME="$(user_home "$RIG_USER")"
+# One resolution, reused everywhere. Overridable so backup/restore can be
+# exercised against a sandbox instead of the operator's real transcripts.
+RIG_HOME="${RIG_HOME:-$(user_home "$RIG_USER")}"
 [ -n "$RIG_HOME" ] || RIG_HOME="$HOME"
 RIG_UID="$(id -u "$RIG_USER" 2>/dev/null || id -u)"
 AGENT_DIR="$RIG_HOME/Library/LaunchAgents"
@@ -327,17 +329,16 @@ cmd_backup() {
   # Resolve the home directory from RIG_USER rather than $HOME: under `sudo rig
   # backup` $HOME is root's, the glob matches nothing, and the archive would be
   # written with zero transcripts while still reporting success.
-  local home; home="$(user_home "$RIG_USER")"; [ -n "$home" ] || home="$HOME"
   enc="$(printf '%s' "$RIG_ROOT/workdirs" | tr '/.' '--')"
   local found=0
   shopt -s nullglob
-  for d in "$home/.claude/projects/$enc"*; do
+  for d in "$RIG_HOME/.claude/projects/$enc"*; do
     cp -a "$d" "$STAGE/transcripts/"
     found=$((found + 1))
   done
   shopt -u nullglob
   if [ "$found" -eq 0 ]; then
-    warn "no transcript directories found under $home/.claude/projects/$enc*"
+    warn "no transcript directories found under $RIG_HOME/.claude/projects/$enc*"
     degraded=1
   fi
 
@@ -370,9 +371,8 @@ cmd_restore() {
   STAGE="$(mktemp -d)"
   tar xzf "$archive" -C "$STAGE"
   cp -a "$STAGE/state/." "$STATE_DIR/"
-  local home; home="$(user_home "$RIG_USER")"; [ -n "$home" ] || home="$HOME"
-  mkdir -p "$home/.claude/projects"
-  [ -d "$STAGE/transcripts" ] && cp -a "$STAGE/transcripts/." "$home/.claude/projects/"
+  mkdir -p "$RIG_HOME/.claude/projects"
+  [ -d "$STAGE/transcripts" ] && cp -a "$STAGE/transcripts/." "$RIG_HOME/.claude/projects/"
   info "restored from $archive -- restart the daemon"
 }
 
@@ -380,7 +380,7 @@ cmd_restore() {
 
 cmd_link_skills() {
   local dst="$HOME/.claude/skills"
-  [ "$(id -u)" -eq 0 ] && dst="$(user_home "$RIG_USER")/.claude/skills"
+  [ "$(id -u)" -eq 0 ] && dst="$RIG_HOME/.claude/skills"
   mkdir -p "$dst"
   shopt -s nullglob
   for src in "$REPO_DIR/skills"/*/; do
