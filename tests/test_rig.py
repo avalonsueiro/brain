@@ -490,6 +490,14 @@ class _FakeChannel:
         self.sent.append(content)
 
 
+class _FakeHistory:
+    def __init__(self) -> None:
+        self.inbound: list[tuple] = []
+
+    def log_inbound(self, channel_id, name, rec, author, text):
+        self.inbound.append((channel_id, name, author, text))
+
+
 class _FakeBot:
     """Just enough surface for Spool: a guild that resolves channels, a queue."""
 
@@ -497,6 +505,7 @@ class _FakeBot:
         self.cfg, self.state, self.draining = cfg, st, False
         self.channels = channels
         self.queued: list[dict] = []
+        self.history = _FakeHistory()
 
     def get_guild(self, gid):
         return self if gid == self.cfg.guild_id else None
@@ -543,6 +552,9 @@ def test_inject_spool() -> None:
     check("label becomes the speaker", bot.queued[0]["author"] == "cron")
     check("text preserved", bot.queued[0]["text"] == "hello there")
     check("channel registered in state", bot.state.get(555) is not None)
+    # Without this the history shows an answer with nothing that provoked it.
+    check("injected turn logged inbound to history", bot.history.inbound == [
+        (555, "general", "cron", "hello there")], str(bot.history.inbound))
 
     print("\ninject: resolution by id")
     spool_mod.write_inject("555", "by numeric id", "test")

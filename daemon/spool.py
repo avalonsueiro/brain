@@ -141,7 +141,15 @@ class Spool:
         except discord.HTTPException as exc:
             log.warning("inject %s: could not post to #%s (%s)", path.name, target, exc)
 
-        self.bot.state.register(channel.id, getattr(channel, "name", target))
+        rec = self.bot.state.register(channel.id, getattr(channel, "name", target))
+        if self.bot.history:
+            # on_message logs inbound for typed messages; the spool bypasses it,
+            # so without this the history shows an answer with nothing that
+            # provoked it -- and "what woke this turn" is exactly what you go
+            # looking for when reading back.
+            self.bot.history.log_inbound(
+                channel.id, getattr(channel, "name", target), rec, label, text
+            )
         self.bot._queue_for(channel.id).put_nowait(
             {"author": label, "text": text, "channel": channel}
         )
