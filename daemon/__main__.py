@@ -29,6 +29,11 @@ def setup_logging(level: str) -> None:
 
 
 async def amain() -> int:
+    # state.json, jobs.json, history.db and the logs hold every message and
+    # answer, session ids, and pending prompts. Nothing else on the box
+    # legitimately reads them, and agent.env was already 0600 -- these should
+    # match rather than defaulting to world-readable 0644.
+    os.umask(0o077)
     config.load_env()
     config.ensure_dirs()
     cfg = config.Config()
@@ -45,7 +50,14 @@ async def amain() -> int:
 
     log.info("rig root %s", config.RIG_ROOT)
     st = state_mod.State()
-    history = History(config.HISTORY_DB) if cfg.history_enabled else None
+    history = None
+    if cfg.history_enabled:
+        try:
+            history = History(config.HISTORY_DB)
+        except Exception:
+            # A best-effort audit log must never crash-loop the daemon under the
+            # service manager. Run without it, exactly as we run without FTS5.
+            log.exception("history unavailable; continuing without the turn log")
     bot = RigBot(cfg, st, history)
 
     loop = asyncio.get_running_loop()

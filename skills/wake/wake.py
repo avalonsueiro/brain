@@ -32,10 +32,27 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-RIG_ROOT = Path(os.environ.get("RIG_ROOT", "/opt/agent-rig"))
-JOBS_FILE = RIG_ROOT / "state" / "jobs.json"
-INJECT_DIR = RIG_ROOT / "inject"
-TZ = os.environ.get("RIG_TZ", "America/New_York")
+# Read at call time, never snapshotted at import.
+#
+# This module is imported by the daemon through `daemon.bot`, which happens
+# BEFORE config.load_env() runs -- so an import-time snapshot froze RIG_TZ from
+# the pre-env-file environment and silently ignored the value in agent.env
+# (launchd sets no RIG_TZ of its own). It also made the test suite's sandbox an
+# accident of line ordering, since a default argument binds once.
+DEFAULT_RIG_ROOT = "/opt/agent-rig"
+DEFAULT_TZ = "America/New_York"
+
+
+def rig_root() -> Path:
+    return Path(os.environ.get("RIG_ROOT", DEFAULT_RIG_ROOT))
+
+
+def jobs_file() -> Path:
+    return rig_root() / "state" / "jobs.json"
+
+
+def tz() -> str:
+    return os.environ.get("RIG_TZ", DEFAULT_TZ)
 
 _DURATION = re.compile(r"(\d+)\s*([smhdw])", re.I)
 _UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
@@ -71,7 +88,7 @@ def parse_at(text: str, now: datetime | None = None) -> int:
     A bare HH:MM already past today means tomorrow -- asking for 08:00 at 9am
     always means tomorrow morning, never nine hours ago.
     """
-    zone = ZoneInfo(TZ)
+    zone = ZoneInfo(tz())
     now = now.astimezone(zone) if now else datetime.now(zone)
     s = (text or "").strip()
 
@@ -97,17 +114,24 @@ def parse_at(text: str, now: datetime | None = None) -> int:
 
 
 def local(epoch: int) -> str:
-    return datetime.fromtimestamp(epoch, ZoneInfo(TZ)).strftime("%a %b %d %H:%M %Z")
+    return datetime.fromtimestamp(epoch, ZoneInfo(tz())).strftime("%a %b %d %H:%M %Z")
 
 
 def human_delta(seconds: float) -> str:
-    """Rounded, not truncated: a 2h wake booked a millisecond ago is 7199.9s,
-    and flooring that to '1h' makes the confirmation look wrong."""
-    seconds = abs(seconds)
-    for div, unit in ((86400, "d"), (3600, "h"), (60, "m")):
-        if seconds >= div * 0.95:
-            return f"{round(seconds / div)}{unit}"
-    return f"{round(seconds)}s"
+    """Two units, so a span is never understated by nearly a whole unit.
+
+    Single-unit rounding called 89 minutes "1h" and 35 hours "1d" -- which on a
+    "(late by ...)" prefix misinforms the agent about how stale its own wake is.
+    """
+    seconds = int(abs(seconds) + 0.5)
+    for div, unit, sub_div, sub_unit in (
+        (86400, "d", 3600, "h"), (3600, "h", 60, "m"), (60, "m", 1, "s")
+    ):
+        if seconds >= div:
+            major, rest = divmod(seconds, div)
+            minor = rest // sub_div
+            return f"{major}{unit}{minor}{sub_unit}" if minor else f"{major}{unit}"
+    return f"{seconds}s"
 
 
 # --- jobs.json -------------------------------------------------------------
@@ -120,9 +144,10 @@ def human_delta(seconds: float) -> str:
 class _Locked:
     """Exclusive lock on jobs.json, held across a read-modify-write."""
 
-    def __init__(self, path: Path = JOBS_FILE) -> None:
-        self.path = path
-        self.lock_path = path.with_suffix(".lock")
+    def __init__(self, path: Path | None = None) -> None:
+        # Resolved per instance, not bound once as a default argument.
+        self.path = path or jobs_file()
+        self.lock_path = self.path.with_suffix(".lock")
 
     def __enter__(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -136,13 +161,43 @@ class _Locked:
         return False
 
     def read(self) -> list[dict]:
+        """Pending jobs. A damaged file is quarantined, never silently emptied.
+
+        Returning [] on bad JSON meant every booked continuation vanished with
+        no trace, and the next add() wrote a one-job file over the corpse.
+        """
         if not self.path.exists():
             return []
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
+            if not isinstance(data, list):
+                raise ValueError(f"top level is {type(data).__name__}, not a list")
+        except (json.JSONDecodeError, ValueError, OSError) as exc:
+            corpse = self.path.with_suffix(f".corrupt.{int(time.time())}")
+            try:
+                os.replace(self.path, corpse)
+            except OSError:
+                corpse = None
+            print(
+                f"wake: jobs.json is unreadable ({exc}) — every pending wake is lost. "
+                f"Saved as {corpse}. Restore from `rig backup` to recover.",
+                file=sys.stderr,
+            )
             return []
-        return data if isinstance(data, list) else []
+        # Drop individually malformed records rather than letting one poison the
+        # whole queue: an un-int-able `at` used to raise inside take_due on every
+        # sweep, silently stopping all wakes forever.
+        clean = []
+        for job in data:
+            try:
+                if isinstance(job, dict):
+                    int(job["at"])
+                    clean.append(job)
+                    continue
+            except (KeyError, TypeError, ValueError):
+                pass
+            print(f"wake: dropping malformed job {job!r}", file=sys.stderr)
+        return clean
 
     def write(self, jobs: list[dict]) -> None:
         tmp = self.path.with_suffix(".json.tmp")
@@ -160,31 +215,31 @@ def _new_id(existing: set[str]) -> str:
 
 def add(channel: str, prompt: str, at: int, label: str = "wake") -> dict:
     job = {"id": "", "at": int(at), "channel": channel, "prompt": prompt, "label": label}
-    with _Locked() as jobs_file:
-        jobs = jobs_file.read()
-        job["id"] = _new_id({j.get("id") for j in jobs})
-        jobs.append(job)
-        jobs.sort(key=lambda j: j.get("at", 0))
-        jobs_file.write(jobs)
+    with _Locked() as jobs:
+        pending = jobs.read()
+        job["id"] = _new_id({j.get("id") for j in pending})
+        pending.append(job)
+        pending.sort(key=lambda j: j.get("at", 0))
+        jobs.write(pending)
     return job
 
 
 def listing(channel: str | None = None) -> list[dict]:
-    with _Locked() as jobs_file:
-        jobs = jobs_file.read()
+    with _Locked() as lock:
+        jobs = lock.read()
     if channel:
-        jobs = [j for j in jobs if j.get("channel") == channel]
+        jobs = [j for j in jobs if str(j.get("channel")) == str(channel)]
     return sorted(jobs, key=lambda j: j.get("at", 0))
 
 
 def cancel(job_id: str) -> dict | None:
-    with _Locked() as jobs_file:
-        jobs = jobs_file.read()
+    with _Locked() as lock:
+        jobs = lock.read()
         keep = [j for j in jobs if j.get("id") != job_id]
         if len(keep) == len(jobs):
             return None
         removed = next(j for j in jobs if j.get("id") == job_id)
-        jobs_file.write(keep)
+        lock.write(keep)
     return removed
 
 
@@ -196,11 +251,11 @@ def take_due(now: int | None = None) -> list[dict]:
     self-continuation can take a real action twice.
     """
     now = int(now if now is not None else time.time())
-    with _Locked() as jobs_file:
-        jobs = jobs_file.read()
+    with _Locked() as lock:
+        jobs = lock.read()
         due = [j for j in jobs if int(j.get("at", 0)) <= now]
         if due:
-            jobs_file.write([j for j in jobs if int(j.get("at", 0)) > now])
+            lock.write([j for j in jobs if int(j.get("at", 0)) > now])
     return due
 
 

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 # --- paths -----------------------------------------------------------------
 
@@ -116,6 +117,11 @@ class Config:
         # reminder is still useful, a thirteen-hour-late one is noise.
         self.wake_max_late = _int("WAKE_MAX_LATE", 12 * 3600)
 
+        # Must stay strictly BELOW the supervisor's kill timer (ExitTimeOut /
+        # TimeoutStopSec, both 300) or a drain that uses its full window races
+        # SIGKILL. bin/rig renders the units, so the pair moves together.
+        self.drain_timeout = _int("DRAIN_TIMEOUT", 280)
+
         # off | minimal | full -- what to show under a successful answer.
         # Errors always get a footer regardless: a silent failure is worse than
         # a noisy success.
@@ -146,6 +152,13 @@ class Config:
             )
         if self.max_concurrent_turns < 1:
             out.append("MAX_CONCURRENT_TURNS must be >= 1")
+        try:
+            # An invalid zone passes silently here and then detonates as an
+            # uncaught ZoneInfoNotFoundError inside !wake, where only ValueError
+            # is handled.
+            ZoneInfo(self.tz)
+        except Exception as exc:
+            out.append(f"RIG_TZ={self.tz!r} is not a valid timezone ({exc})")
         return out
 
 

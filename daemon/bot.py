@@ -39,8 +39,13 @@ class RigBot(discord.Client):
         self.sem = asyncio.Semaphore(cfg.max_concurrent_turns)
         self.queues: dict[int, asyncio.Queue] = {}
         self.workers: dict[int, asyncio.Task] = {}
-        self.running: dict[int, object] = {}   # channel_id -> live subprocess
-        self.aborted: set[int] = set()
+        # channel_id -> (generation, live subprocess). The generation is what
+        # gives an abort an identity: without it, `!abort` landing just as a
+        # turn completed would kill nothing, report success, and still cause the
+        # finished answer to be thrown away.
+        self.running: dict[int, tuple[int, object]] = {}
+        self.aborted: dict[int, int] = {}      # channel_id -> generation aborted
+        self._generation = 0
         # Channels whose worker has claimed work but may not have spawned yet.
         # Set synchronously at the top of the worker loop; this, not
         # active_turns, is what drain() must wait on.
@@ -77,16 +82,20 @@ class RigBot(discord.Client):
             len(self.state.all()),
         )
 
-    async def drain(self, timeout: float = 300.0) -> None:
+    async def drain(self, timeout: float | None = None) -> None:
         """Stop accepting work, let in-flight turns finish, then close.
 
         A restart that kills live turns is how you lose a channel mid-thought.
         systemd gets `KillMode=mixed`; this is the same contract on macOS.
         """
+        timeout = timeout if timeout is not None else self.cfg.drain_timeout
         self.draining = True
-        # Stop pulling new work off the spool. Anything already enqueued is
-        # counted below and still gets answered.
-        self.spool.stop()
+        # Stop pulling new work off the spool, and WAIT for the sweep to finish.
+        # Cancelling without awaiting let an in-flight _consume resume after
+        # drain had already sampled "0 outstanding", enqueue its item, and
+        # unlink the spool file -- losing an injected message that was never
+        # answered.
+        await self.spool.stop()
 
         def outstanding() -> int:
             # Queued-but-unstarted counts too: a worker between turns has
@@ -164,8 +173,16 @@ class RigBot(discord.Client):
 
     async def _worker(self, channel_id: int) -> None:
         q = self.queues[channel_id]
+        # A raw item (a slash command) must run alone in its turn. Held here
+        # rather than re-queued at the tail: re-queuing put it behind every
+        # message that arrived during the turn, so under steady traffic
+        # `!compact` was deferred forever after announcing "compaction queued".
+        deferred: dict | None = None
         while True:
-            items = [await q.get()]
+            if deferred is not None:
+                items, deferred = [deferred], None
+            else:
+                items = [await q.get()]
             # Claim the work synchronously, before any await. drain() watches
             # this set: active_turns is only incremented several awaits deep in
             # _run_turn, so a shutdown landing in that window would see "0 turns
@@ -173,10 +190,6 @@ class RigBot(discord.Client):
             self.busy.add(channel_id)
             # Coalesce everything queued since the last turn into ONE turn.
             # Three messages typed in two seconds cost one turn, not three.
-            # A raw item (a slash command) must stay alone in its turn, so it
-            # neither absorbs neighbours nor gets absorbed -- it is put back and
-            # runs on the next pass instead of being dropped.
-            deferred = None
             if not items[0].get("raw"):
                 while True:
                     try:
@@ -191,13 +204,25 @@ class RigBot(discord.Client):
                 await self._run_turn(channel_id, items)
             except Exception:
                 log.exception("turn failed in channel %s", channel_id)
+                await self._say_internal_error(items)
             finally:
                 for _ in items:
                     q.task_done()
                 if deferred is not None:
-                    q.put_nowait(deferred)
+                    # Its get_nowait is accounted for now; it runs next pass.
                     q.task_done()
                 self.busy.discard(channel_id)
+
+    @staticmethod
+    async def _say_internal_error(items: list[dict]) -> None:
+        """A crashed turn must not leave the user staring at '⏳ thinking…'."""
+        channel = items[0].get("channel")
+        if channel is None:
+            return
+        try:
+            await channel.send("⚠️ internal error running this turn — see the daemon log.")
+        except Exception:
+            log.exception("could not report the internal error to the channel")
 
     async def _run_turn(self, channel_id: int, items: list[dict]) -> None:
         channel = items[0].get("channel") or self.get_channel(channel_id)
@@ -232,7 +257,9 @@ class RigBot(discord.Client):
             elif kind == "reset":
                 tick.reset()
 
-        self.aborted.discard(channel_id)
+        self._generation += 1
+        generation = self._generation
+        self.aborted.pop(channel_id, None)
         self.active_turns += 1
         started = time.monotonic()
         try:
@@ -243,20 +270,27 @@ class RigBot(discord.Client):
                         rec=rec,
                         prompt=prompt,
                         on_event=on_event,
-                        register_proc=lambda p: self.running.update({channel_id: p}),
+                        # Re-registered per attempt, so an abort between retries
+                        # cannot kill a corpse and report success.
+                        register_proc=lambda p: self.running.update(
+                            {channel_id: (generation, p)}
+                        ),
                     )
         finally:
             self.active_turns -= 1
             self.running.pop(channel_id, None)
 
         await tick.maybe_edit(force=True)
-        await self._deliver(channel, channel_id, rec, tick, result, started)
+        await self._deliver(channel, channel_id, rec, tick, result, started, generation)
 
-    async def _deliver(self, channel, channel_id, rec, tick, result, started) -> None:
+    async def _deliver(self, channel, channel_id, rec, tick, result, started, generation) -> None:
         elapsed = time.monotonic() - started
 
-        if channel_id in self.aborted:
-            self.aborted.discard(channel_id)
+        # Honour the abort only if it targeted THIS turn. An abort that raced a
+        # natural completion killed nothing, so discarding the finished answer
+        # would lose real work and skip both bump_turn and history.
+        if self.aborted.get(channel_id) == generation:
+            self.aborted.pop(channel_id, None)
             await tick.finish(f"⛔ aborted after {elapsed:.0f}s", "")
             return
 
@@ -269,12 +303,17 @@ class RigBot(discord.Client):
 
         if result.is_error:
             detail = result.text or ""
-            if result.stderr_tail and result.error_kind != "missing_transcript":
+            if result.stderr_tail and result.error_kind != harness_mod.KIND_MISSING_TRANSCRIPT:
                 tail = result.stderr_tail.strip()[-1200:]
                 detail = f"{detail}\n\n```\n{tail}\n```" if detail else f"```\n{tail}\n```"
-            icon = {"timeout": "⏱️", "missing_transcript": "🧠", "spawn": "💥"}.get(
-                result.error_kind, "⚠️"
-            )
+            icon = {
+                harness_mod.KIND_TIMEOUT: "⏱️",
+                harness_mod.KIND_MISSING_TRANSCRIPT: "🧠",
+                harness_mod.KIND_SPAWN: "💥",
+                harness_mod.KIND_TRUNCATED: "✂️",
+                harness_mod.KIND_NO_RESULT: "🕳️",
+                harness_mod.KIND_RIG: "🔧",
+            }.get(result.error_kind, "⚠️")
             label = result.error_kind or "error"
             await tick.finish(
                 f"{icon} turn failed ({label}, exit={result.exit_code}) · {elapsed:.0f}s",
@@ -325,9 +364,14 @@ class RigBot(discord.Client):
     # --- abort -------------------------------------------------------------
 
     async def abort(self, channel_id: int) -> bool:
-        proc = self.running.get(channel_id)
-        if proc is None:
+        entry = self.running.get(channel_id)
+        if entry is None:
             return False
-        self.aborted.add(channel_id)
+        generation, proc = entry
+        if proc.returncode is not None:
+            # The turn finished while the command was in flight. Killing a
+            # corpse and claiming success would also discard its answer.
+            return False
+        self.aborted[channel_id] = generation
         await self.harness.kill(proc)
         return True

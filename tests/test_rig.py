@@ -34,9 +34,11 @@ from daemon import config, harness as harness_mod, spool as spool_mod, state as 
 from daemon.ticker import split_message  # noqa: E402
 
 wake_mod = spool_mod.wake_mod
-# The wake module snapshots RIG_ROOT at import time; point it at the sandbox.
-wake_mod.JOBS_FILE = config.JOBS_FILE
-wake_mod.INJECT_DIR = config.INJECT_DIR
+# wake resolves RIG_ROOT/RIG_TZ per call now, so the sandbox is real rather than
+# an accident of import order. Assert it loudly -- a regression here would have
+# the suite writing the operator's live jobs.json.
+assert str(TMP) in str(wake_mod.jobs_file()), (
+    f"tests would write the real jobs file: {wake_mod.jobs_file()}")
 
 PASS = FAIL = 0
 
@@ -85,6 +87,9 @@ if mode == "prose_about_session":
                       "is_error": True, "session_id": sid,
                       "result": "The session is already in use and the model was not found."
                       }), flush=True)
+    sys.exit(0)
+if mode == "silent_success":
+    print(json.dumps({"type": "system", "subtype": "init", "session_id": sid}), flush=True)
     sys.exit(0)
 if mode == "big":
     big = "z" * 200000
@@ -400,7 +405,7 @@ def test_wake_parsing() -> None:
 
     from datetime import datetime
     from zoneinfo import ZoneInfo
-    zone = ZoneInfo(wake_mod.TZ)
+    zone = ZoneInfo(wake_mod.tz())
     noon = datetime(2026, 6, 15, 12, 0, tzinfo=zone)
 
     at = wake_mod.parse_at("18:30", now=noon)
@@ -424,6 +429,12 @@ def test_wake_parsing() -> None:
 
     check("human_delta rounds, not truncates", wake_mod.human_delta(7199.9) == "2h",
           wake_mod.human_delta(7199.9))
+    # Single-unit rounding called 89 minutes "1h", which misinforms an agent
+    # about how stale its own wake is.
+    check("human_delta shows two units", wake_mod.human_delta(89 * 60) == "1h29m",
+          wake_mod.human_delta(89 * 60))
+    check("human_delta on days", wake_mod.human_delta(35 * 3600) == "1d11h",
+          wake_mod.human_delta(35 * 3600))
 
 
 def test_wake_jobs() -> None:
@@ -465,7 +476,6 @@ def test_wake_concurrent_writers() -> None:
         "import sys, time\n"
         f"sys.path.insert(0, {str(ROOT / 'skills' / 'wake')!r})\n"
         "import wake\n"
-        f"wake.JOBS_FILE = __import__('pathlib').Path({str(config.JOBS_FILE)!r})\n"
         "wake.add('general', sys.argv[1], int(time.time()) + 3600)\n",
         encoding="utf-8",
     )
@@ -632,9 +642,19 @@ def test_wake_firing() -> None:
 
     wake_mod.add("general", "stale", now - 13 * 3600)
     spool._fire_due()
-    check("past WAKE_MAX_LATE is dropped, not fired",
-          list(config.INJECT_DIR.glob("*.json")) == [])
+    files = list(config.INJECT_DIR.glob("*.json"))
     check("dropped job is removed from jobs.json", wake_mod.listing() == [])
+    # A silently dropped wake stops an unattended workflow with no visible
+    # cause: the agent that booked it and the operator both see nothing.
+    check("the drop is announced, not silent", len(files) == 1, str(files))
+    notice = json.loads(files[0].read_text())
+    check("notice says it was dropped", "dropped" in notice["text"])
+    check("notice carries the original text", "stale" in notice["text"])
+    check("notice tells the agent not to act on it", "Do not act on it" in notice["text"])
+    check("notice is labelled as coming from the rig", notice["label"] == "rig")
+
+    for f in config.INJECT_DIR.glob("*.json"):
+        f.unlink()
 
     print("\nwake: survives a daemon restart")
     config.JOBS_FILE.unlink(missing_ok=True)
@@ -645,6 +665,363 @@ def test_wake_firing() -> None:
     check("job booked before the restart still fires",
           any("after restart" in json.loads(f.read_text())["text"]
               for f in config.INJECT_DIR.glob("*.json")))
+
+
+# --- bot.py and commands.py -------------------------------------------------
+#
+# These two files own the entire Discord surface -- the authorization gate, the
+# coalescing loop, drain, and every ! command -- and had no coverage at all, not
+# even import coverage. discord.Client constructs fine offline, so the only
+# stubs needed are the message/channel objects.
+
+
+class _FakeAuthor:
+    def __init__(self, uid: int, name: str = "avalon", bot: bool = False) -> None:
+        self.id, self.display_name, self.bot = uid, name, bot
+
+    def __str__(self) -> str:
+        return self.display_name
+
+
+class _FakeGuild:
+    def __init__(self, gid: int) -> None:
+        self.id, self.name = gid, "test"
+
+
+class _FakeMessage:
+    def __init__(self, content, channel, author, guild) -> None:
+        self.content, self.channel, self.author = content, channel, author
+        self.guild, self.attachments = guild, []
+
+
+def _make_bot(allowed=(42,), ignore=""):
+    os.environ.update({
+        "DISCORD_BOT_TOKEN": "x", "DISCORD_GUILD_ID": "7",
+        "DISCORD_ALLOWED_USER_IDS": " ".join(str(u) for u in allowed),
+        "DISCORD_IGNORE_CHANNELS": ignore,
+    })
+    from daemon.bot import RigBot
+    cfg = config.Config()
+    bot = RigBot(cfg, fresh_state(), None)
+    channel = _FakeChannel(555, "general")
+    guild = _FakeGuild(7)
+    bot.get_channel = lambda cid: channel if cid == 555 else None
+    return bot, channel, guild
+
+
+def _msg(bot, channel, guild, content, uid=42, name="avalon", is_bot=False):
+    return _FakeMessage(content, channel, _FakeAuthor(uid, name, is_bot), guild)
+
+
+def test_authorization_gate() -> None:
+    print("\nbot: the authorization gate")
+
+    async def scenario():
+        bot, channel, guild = _make_bot()
+        # The allowlist is the ONLY containment for a daemon running with
+        # --dangerously-skip-permissions, and nothing tested it.
+        await bot.on_message(_msg(bot, channel, guild, "hi", uid=999, name="stranger"))
+        check("non-allowlisted user is dropped", bot.queues == {} and channel.sent == [])
+
+        await bot.on_message(_msg(bot, channel, guild, "hi", uid=42, is_bot=True))
+        check("a bot author is ignored", bot.queues == {})
+
+        outsider = _FakeMessage("hi", channel, _FakeAuthor(42), _FakeGuild(999))
+        await bot.on_message(outsider)
+        check("wrong guild is ignored", bot.queues == {})
+
+        dm = _FakeMessage("hi", channel, _FakeAuthor(42), None)
+        await bot.on_message(dm)
+        check("a DM (no guild) is ignored", bot.queues == {})
+
+        await bot.on_message(_msg(bot, channel, guild, "   "))
+        check("empty content is ignored", bot.queues == {})
+
+        await bot.on_message(_msg(bot, channel, guild, "hello"))
+        check("an allowlisted user is queued", bot.queues[555].qsize() == 1)
+        for task in bot.workers.values():
+            task.cancel()
+
+        # DISCORD_IGNORE_CHANNELS
+        bot2, ch2, g2 = _make_bot(ignore="general")
+        await bot2.on_message(_msg(bot2, ch2, g2, "hello"))
+        check("an ignored channel never runs a turn", bot2.queues == {})
+        for task in bot2.workers.values():
+            task.cancel()
+
+    asyncio.run(scenario())
+
+
+def test_coalescing_and_raw() -> None:
+    print("\nbot: coalescing and raw-item ordering")
+
+    async def scenario():
+        bot, channel, guild = _make_bot()
+        turns: list[list[dict]] = []
+
+        async def fake_run_turn(channel_id, items):
+            turns.append(list(items))
+            await asyncio.sleep(0)
+
+        bot._run_turn = fake_run_turn
+        q = bot._queue_for(555)
+        for word in ("one", "two", "three"):
+            q.put_nowait({"author": "avalon", "text": word, "channel": channel})
+        await asyncio.sleep(0.05)
+        check("three messages coalesce into one turn", len(turns) == 1, str(turns))
+        check("all three lines are present",
+              [i["text"] for i in turns[0]] == ["one", "two", "three"])
+
+        # A raw item must run alone, and must not be starved by later traffic.
+        turns.clear()
+        q.put_nowait({"author": "a", "text": "before", "channel": channel})
+        q.put_nowait({"author": "a", "text": "/compact", "channel": channel, "raw": True})
+        q.put_nowait({"author": "a", "text": "after", "channel": channel})
+        await asyncio.sleep(0.05)
+        shapes = [[i["text"] for i in t] for t in turns]
+        check("raw item is not absorbed into a batch", ["/compact"] in shapes, str(shapes))
+        # Re-queuing it at the tail put it behind everything that arrived during
+        # the turn, so under steady traffic !compact never ran.
+        check("raw item runs before later messages",
+              shapes.index(["/compact"]) < shapes.index(["after"]), str(shapes))
+        for task in bot.workers.values():
+            task.cancel()
+
+    asyncio.run(scenario())
+
+
+def test_drain_waits_for_claimed_work() -> None:
+    print("\nbot: drain")
+
+    async def scenario():
+        bot, channel, guild = _make_bot()
+        released = asyncio.Event()
+
+        async def slow_turn(channel_id, items):
+            await released.wait()
+
+        bot._run_turn = slow_turn
+        bot.close = lambda: asyncio.sleep(0)          # no gateway to close
+        bot._queue_for(555).put_nowait({"author": "a", "text": "x", "channel": channel})
+        await asyncio.sleep(0.05)
+        # The invariant that only a comment guarded: busy is claimed
+        # synchronously, so a shutdown in the spawn window cannot see "0 in
+        # flight" and close the client out from under a live message.
+        check("claimed work marks the channel busy", 555 in bot.busy)
+
+        drain = asyncio.create_task(bot.drain(timeout=5))
+        await asyncio.sleep(0.1)
+        check("drain waits while a turn is claimed", not drain.done())
+        released.set()
+        await asyncio.wait_for(drain, timeout=5)
+        check("drain returns once the turn finishes", drain.done())
+        check("busy is cleared", bot.busy == set())
+        for task in bot.workers.values():
+            task.cancel()
+
+    asyncio.run(scenario())
+
+
+def test_commands() -> None:
+    print("\ncommands: the ! surface")
+    from daemon import commands as cmd_mod
+
+    async def scenario():
+        bot, channel, guild = _make_bot()
+        config.JOBS_FILE.unlink(missing_ok=True)
+
+        async def handle(text):
+            channel.sent.clear()
+            await cmd_mod.handle(bot, _msg(bot, channel, guild, text), text)
+            return " ".join(channel.sent)
+
+        check("!ping reports load", "up" in await handle("!ping"))
+        check("!ctx shows the session", "session" in await handle("!ctx"))
+
+        out = await handle("!model sonnet")
+        check("!model switches", "sonnet" in out and bot.state.get(555)["model"] == "sonnet")
+        check("!model clears the resolution cache",
+              bot.state.get(555).get("model_resolved") is None)
+        check("!model rejects an unknown alias", "unknown alias" in await handle("!model nope"))
+
+        old = bot.state.get(555)["session_id"]
+        await handle("!reset")
+        check("!reset mints a new session", bot.state.get(555)["session_id"] != old)
+
+        check("!abort with nothing running says so", "nothing running" in await handle("!abort"))
+        check("unknown command is reported", "unknown command" in await handle("!nope"))
+
+        # !wake, end to end through the real jobs.json
+        out = await handle("!wake in 2h check the build")
+        check("!wake books a job", "⏰" in out, out)
+        jobs = wake_mod.listing(str(555))
+        check("the job is keyed by channel id, not name", len(jobs) == 1, str(jobs))
+        check("the prompt is stored whole", jobs[0]["prompt"] == "check the build")
+
+        out = await handle("!wake list")
+        check("!wake list shows it", jobs[0]["id"] in out)
+
+        out = await handle(f"!wake cancel {jobs[0]['id']}")
+        check("!wake cancel removes it", "cancelled" in out and wake_mod.listing(str(555)) == [])
+        check("!wake cancel of a missing id says so", "no wake job" in await handle("!wake cancel zzzz"))
+
+        # "6:30 pm" arrives as two tokens; parsing only the first booked 06:30.
+        await handle("!wake at 6:30 pm stand up")
+        job = wake_mod.listing(str(555))[0]
+        hour = int(wake_mod.local(job["at"]).split()[-2].split(":")[0])
+        check("'6:30 pm' books the evening, not the morning", hour == 18, str(hour))
+        check("the meridiem does not leak into the prompt",
+              job["prompt"] == "stand up", job["prompt"])
+        check("bad duration is reported", "bad duration" in await handle("!wake in 2huor x"))
+
+    asyncio.run(scenario())
+
+
+def test_abort_identity() -> None:
+    print("\nbot: abort has turn identity")
+
+    class _DeadProc:
+        returncode = 0
+
+    class _LiveProc:
+        returncode = None
+        pid = os.getpid()
+
+    async def scenario():
+        bot, channel, guild = _make_bot()
+        # Aborting a turn that already finished must not claim success -- doing
+        # so also threw away the completed answer in _deliver.
+        bot.running[555] = (1, _DeadProc())
+        check("abort of a finished turn reports nothing to kill", await bot.abort(555) is False)
+        check("a finished turn is not marked aborted", 555 not in bot.aborted)
+
+        bot.running[555] = (2, _LiveProc())
+        bot.harness.kill = lambda proc: asyncio.sleep(0)
+        check("abort of a live turn succeeds", await bot.abort(555) is True)
+        check("the abort records which turn it killed", bot.aborted[555] == 2)
+
+    asyncio.run(scenario())
+
+
+def test_primed_commits_at_init() -> None:
+    print("\nharness: primed commits at init, not at result")
+    st = fresh_state()
+    cfg = make_cfg(write_stub())
+    os.environ["STUB_MODE"] = "die_after_init"
+    rec = st.register(930, "died")
+
+    # The stub emits init and then dies with no result. If primed were committed
+    # at result instead, the next turn would retry --session-id against a uuid
+    # whose transcript already exists and fail forever. The happy-path stub
+    # cannot prove this -- it emits both events.
+    res, _ = asyncio.run(run(cfg, st, rec, 930))
+    check("the turn is reported as failed", res.is_error)
+    check("primed was committed at init anyway", st.get(930)["primed"] is True)
+
+    touch_transcript(st.get(930))
+    os.environ["STUB_MODE"] = "ok"
+    res2, _ = asyncio.run(run(cfg, st, st.get(930), 930))
+    check("the next turn resumes rather than erroring", res2.resumed is True)
+    check("and succeeds", not res2.is_error, f"{res2.error_kind} {res2.stderr_tail}")
+
+
+def test_reset_midturn_cannot_brick_the_channel() -> None:
+    print("\nharness: !reset racing a live turn")
+    st = fresh_state()
+    cfg = make_cfg(write_stub())
+    os.environ["STUB_MODE"] = "ok"
+    rec = st.register(940, "raced")
+    old_session = rec["session_id"]
+
+    class _Racing(harness_mod.ClaudeHarness):
+        async def _read_stdout(self, proc, channel_id, session_id, result, on_event):
+            # Simulate `!reset` landing mid-turn: it mutates the very dict the
+            # turn is holding. Reading rec["session_id"] lazily made the guard
+            # compare a value to itself, marking a uuid primed whose transcript
+            # will never exist -- bricking the channel on the next turn.
+            self.state.reset_session(940)
+            return await super()._read_stdout(proc, channel_id, session_id, result, on_event)
+
+    async def go():
+        h = _Racing(cfg, st)
+
+        async def on_event(kind, payload):
+            pass
+
+        return await h.run_turn(channel_id=940, rec=rec, prompt="hi", on_event=on_event)
+
+    asyncio.run(go())
+    new_session = st.get(940)["session_id"]
+    check("the reset took effect", new_session != old_session)
+    check("the new session was NOT marked primed", st.get(940)["primed"] is False)
+
+    # The proof: the next turn starts cleanly instead of dying on the hard gate.
+    res, _ = asyncio.run(run(cfg, st, st.get(940), 940))
+    check("the channel still works after the race", not res.is_error,
+          f"{res.error_kind}: {res.text[:120]}")
+
+
+def test_oversized_line_is_not_silent() -> None:
+    print("\nharness: a line over the stream limit")
+    st = fresh_state()
+    cfg = make_cfg(write_stub())
+    os.environ["STUB_MODE"] = "big"
+    rec = st.register(950, "oversized")
+
+    original = harness_mod._STREAM_LIMIT
+    harness_mod._STREAM_LIMIT = 4096          # the 200KB result now overruns
+    try:
+        res, _ = asyncio.run(run(cfg, st, rec, 950))
+    finally:
+        harness_mod._STREAM_LIMIT = original
+
+    check("the drop is counted", res.dropped_events > 0, str(res.dropped_events))
+    # Without this the turn was delivered under a success footer reading
+    # "(no text output)" -- work that appears to succeed while doing nothing.
+    check("the turn is reported as an error", res.is_error)
+    check("classified as truncated", res.error_kind == harness_mod.KIND_TRUNCATED,
+          str(res.error_kind))
+
+
+def test_exit_zero_without_result() -> None:
+    print("\nharness: clean exit that never reports a result")
+    st = fresh_state()
+    cfg = make_cfg(write_stub())
+    os.environ["STUB_MODE"] = "silent_success"
+    rec = st.register(960, "silent")
+
+    res, _ = asyncio.run(run(cfg, st, rec, 960))
+    check("not reported as a success", res.is_error)
+    check("classified as no_result", res.error_kind == harness_mod.KIND_NO_RESULT,
+          str(res.error_kind))
+    check("exit code was actually zero", res.exit_code == 0)
+
+
+def test_child_env_has_no_secrets() -> None:
+    print("\nharness: the child environment")
+    cfg = make_cfg(write_stub())
+    os.environ["DISCORD_BOT_TOKEN"] = "super-secret-token"
+    env = harness_mod.ClaudeHarness(cfg, fresh_state())._child_env()
+    # A turn ingests untrusted web pages and repos; one prompt injection running
+    # `printenv` would otherwise hand over the bot token.
+    for secret in ("DISCORD_BOT_TOKEN", "DISCORD_GUILD_ID", "DISCORD_ALLOWED_USER_IDS"):
+        check(f"{secret} is stripped", secret not in env)
+    check("TZ is still passed through", env.get("TZ") == cfg.tz)
+
+
+def test_bash_transcript_encoding_parity() -> None:
+    print("\nbin/rig: transcript encoding matches the Python implementation")
+    # cmd_backup reimplements the encoding in bash (tr '/.' '--'). If the two
+    # ever diverge, --resume keeps working while hourly backups silently contain
+    # zero transcripts.
+    for path in ("/opt/agent-rig/workdirs", "/opt/agent-rig/workdirs/a.b",
+                 "/tmp/rig-test/x.y.z"):
+        out = subprocess.run(
+            ["bash", "-c", f"printf '%s' {path!r} | tr '/.' '--'"],
+            capture_output=True, text=True,
+        ).stdout
+        check(f"bash and python agree on {path}",
+              out == state_mod.encode_workdir(path), f"{out!r} != {state_mod.encode_workdir(path)!r}")
 
 
 def test_compaction_detection() -> None:
@@ -722,6 +1099,17 @@ def main() -> int:
         test_large_events()
         test_partial_answer_is_an_error()
         test_classifiers_ignore_model_prose()
+        test_authorization_gate()
+        test_coalescing_and_raw()
+        test_drain_waits_for_claimed_work()
+        test_commands()
+        test_abort_identity()
+        test_primed_commits_at_init()
+        test_reset_midturn_cannot_brick_the_channel()
+        test_oversized_line_is_not_silent()
+        test_exit_zero_without_result()
+        test_child_env_has_no_secrets()
+        test_bash_transcript_encoding_parity()
         test_compaction_detection()
     finally:
         shutil.rmtree(TMP, ignore_errors=True)

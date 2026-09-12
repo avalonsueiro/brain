@@ -37,7 +37,17 @@ UNIT_DIR="/etc/systemd/system"
 # a system-domain job has no user session to unlock one -- every turn fails with
 # "Not logged in" even when the job runs as the right user. Consequence: no sudo
 # for install/start/stop, and the rig starts at login rather than at boot.
-RIG_HOME="$(eval echo "~$RIG_USER")"
+# Resolved without eval: RIG_USER comes from the environment, and `eval echo`
+# on it would execute a value like `x; rm -rf ...` -- as root under sudo.
+user_home() {
+  if [ "$(uname -s)" = "Darwin" ]; then
+    dscl . -read "/Users/$1" NFSHomeDirectory 2>/dev/null | awk '{print $2}'
+  else
+    getent passwd "$1" | cut -d: -f6
+  fi
+}
+RIG_HOME="$(user_home "$RIG_USER")"
+[ -n "$RIG_HOME" ] || RIG_HOME="$HOME"
 RIG_UID="$(id -u "$RIG_USER" 2>/dev/null || id -u)"
 AGENT_DIR="$RIG_HOME/Library/LaunchAgents"
 PLIST_DST="$AGENT_DIR/$LABEL.plist"
@@ -103,8 +113,19 @@ cmd_bootstrap() {
   info "creating $RIG_ROOT"
   mkdir -p "$RIG_ROOT"/{inject,workdirs,state/{logs,backups}}
   chown -R "$RIG_USER:$(rig_group)" "$RIG_ROOT"
-  chmod -R g+rwX "$RIG_ROOT"
-  find "$RIG_ROOT" -type d -exec chmod g+s {} +   # new files inherit the group
+
+  # Group-share ONLY when a dedicated account owns the tree. With the default
+  # RIG_USER the group resolves to the user's primary group -- `staff` on
+  # macOS, which contains every local account -- so g+rwX would hand directory
+  # write on state/ and workdirs/ to the whole machine. Directory write lets
+  # anyone replace jobs.json regardless of its mode, which fires an ungated
+  # turn and defeats the 0700 spool entirely.
+  if [ "$RIG_USER" != "${SUDO_USER:-$(id -un)}" ]; then
+    chmod -R g+rwX "$RIG_ROOT"
+    find "$RIG_ROOT" -type d -exec chmod g+s {} +  # new files inherit the group
+  else
+    chmod -R go-rwx "$RIG_ROOT"
+  fi
   # The spool is an unauthenticated path to running turns -- keep it private.
   chmod 700 "$RIG_ROOT/inject"
 
@@ -296,16 +317,17 @@ cmd_backup() {
   # sqlite3 .backup, not cp: the daemon writes this DB continuously, and copying
   # the .db/-wal/-shm trio file-by-file can capture three mutually inconsistent
   # snapshots -- a "successful" backup you discover is corrupt at restore time.
+  local degraded=0
   if [ -e "$STATE_DIR/history.db" ]; then
     sqlite3 "$STATE_DIR/history.db" ".backup '$STAGE/state/history.db'" \
-      || warn "history.db backup failed"
+      || { warn "history.db backup failed"; degraded=1; }
   fi
 
   # Transcript dirs are named after the encoded cwd: / and . both become -.
   # Resolve the home directory from RIG_USER rather than $HOME: under `sudo rig
   # backup` $HOME is root's, the glob matches nothing, and the archive would be
   # written with zero transcripts while still reporting success.
-  local home; home="$(eval echo "~$RIG_USER")"
+  local home; home="$(user_home "$RIG_USER")"; [ -n "$home" ] || home="$HOME"
   enc="$(printf '%s' "$RIG_ROOT/workdirs" | tr '/.' '--')"
   local found=0
   shopt -s nullglob
@@ -314,7 +336,10 @@ cmd_backup() {
     found=$((found + 1))
   done
   shopt -u nullglob
-  [ "$found" -eq 0 ] && warn "no transcript directories found under $home/.claude/projects/$enc*"
+  if [ "$found" -eq 0 ]; then
+    warn "no transcript directories found under $home/.claude/projects/$enc*"
+    degraded=1
+  fi
 
   tar czf "$out" -C "$STAGE" .
   info "backup -> $out ($(du -h "$out" | cut -f1))"
@@ -323,8 +348,18 @@ cmd_backup() {
   local n
   n="$(ls -1t "$STATE_DIR/backups"/rig-*.tar.gz 2>/dev/null | wc -l | tr -d ' ')"
   if [ "$n" -gt "$BACKUP_KEEP" ]; then
-    ls -1t "$STATE_DIR/backups"/rig-*.tar.gz | tail -n +$((BACKUP_KEEP + 1)) | xargs rm -f
+    # -print0/-0: a hostile or merely odd filename must not word-split into
+    # deleting something else.
+    ls -1t "$STATE_DIR/backups"/rig-*.tar.gz | tail -n +$((BACKUP_KEEP + 1)) \
+      | tr '\n' '\0' | xargs -0 rm -f
     info "rotated $((n - BACKUP_KEEP)) old backup(s)"
+  fi
+
+  # Exit nonzero on a degraded archive so the hourly job is recorded as failed
+  # rather than silently producing backups you discover are empty at restore.
+  if [ "$degraded" -ne 0 ]; then
+    warn "backup completed but is INCOMPLETE -- see warnings above"
+    return 1
   fi
 }
 
@@ -335,7 +370,7 @@ cmd_restore() {
   STAGE="$(mktemp -d)"
   tar xzf "$archive" -C "$STAGE"
   cp -a "$STAGE/state/." "$STATE_DIR/"
-  local home; home="$(eval echo "~$RIG_USER")"
+  local home; home="$(user_home "$RIG_USER")"; [ -n "$home" ] || home="$HOME"
   mkdir -p "$home/.claude/projects"
   [ -d "$STAGE/transcripts" ] && cp -a "$STAGE/transcripts/." "$home/.claude/projects/"
   info "restored from $archive -- restart the daemon"
@@ -345,7 +380,7 @@ cmd_restore() {
 
 cmd_link_skills() {
   local dst="$HOME/.claude/skills"
-  [ "$(id -u)" -eq 0 ] && dst="$(eval echo "~$RIG_USER")/.claude/skills"
+  [ "$(id -u)" -eq 0 ] && dst="$(user_home "$RIG_USER")/.claude/skills"
   mkdir -p "$dst"
   shopt -s nullglob
   for src in "$REPO_DIR/skills"/*/; do

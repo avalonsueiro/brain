@@ -177,9 +177,14 @@ async def _wake(bot, channel, rec, args: list[str]) -> None:
     """`!wake` — the same parsing and the same jobs.json the CLI uses.
 
     Imported from skills/wake rather than reimplemented, so a fix to duration
-    parsing lands in both places at once.
+    parsing lands in both places at once. Every jobs.json call goes through
+    to_thread: the flock is held by a separate CLI process by design, so a slow
+    holder would otherwise freeze the whole event loop, gateway heartbeat
+    included.
     """
     from .spool import wake_mod
+
+    channel_id = channel.id
 
     if not args:
         await channel.send(WAKE_HELP)
@@ -188,21 +193,22 @@ async def _wake(bot, channel, rec, args: list[str]) -> None:
     sub = args[0].lower()
 
     if sub == "list":
-        jobs = wake_mod.listing(rec["name"])
+        jobs = await asyncio.to_thread(wake_mod.listing, str(channel_id))
         if not jobs:
             await channel.send("no wake jobs pending for this channel.")
             return
         now = time.time()
         lines = []
         for job in jobs:
-            delta = job["at"] - now
+            delta = job.get("at", 0) - now
             when = (
                 f"in {wake_mod.human_delta(delta)}"
                 if delta >= 0
                 else f"{wake_mod.human_delta(delta)} LATE"
             )
             lines.append(
-                f"{job['id']}  {wake_mod.local(job['at'])}  ({when})  {job['prompt'][:70]}"
+                f"{job.get('id', '?')}  {wake_mod.local(job.get('at', 0))}  "
+                f"({when})  {str(job.get('prompt', ''))[:70]}"
             )
         await channel.send("```\n" + "\n".join(lines) + "\n```")
         return
@@ -211,7 +217,7 @@ async def _wake(bot, channel, rec, args: list[str]) -> None:
         if len(args) < 2:
             await channel.send("which one? `!wake cancel <id>` — `!wake list` shows ids.")
             return
-        removed = wake_mod.cancel(args[1])
+        removed = await asyncio.to_thread(wake_mod.cancel, args[1])
         if removed is None:
             await channel.send(f"no wake job `{args[1]}`.")
         else:
@@ -222,7 +228,17 @@ async def _wake(bot, channel, rec, args: list[str]) -> None:
         await channel.send(WAKE_HELP)
         return
 
-    when_arg, prompt = args[1], " ".join(args[2:]).strip()
+    when_arg, rest = args[1], args[2:]
+    # "6:30 pm" arrives as two tokens. Without this, "6:30" parses as 06:30 and
+    # the wake fires twelve hours off with no error at all, while "pm" leaks
+    # into the prompt.
+    if sub == "at" and rest and rest[0].lower() in ("am", "pm"):
+        when_arg, rest = when_arg + rest[0].lower(), rest[1:]
+    prompt = " ".join(rest).strip()
+    if not prompt:
+        await channel.send(WAKE_HELP)
+        return
+
     try:
         at = (
             int(time.time()) + wake_mod.parse_duration(when_arg)
@@ -233,7 +249,10 @@ async def _wake(bot, channel, rec, args: list[str]) -> None:
         await channel.send(f"⚠️ {exc}")
         return
 
-    job = wake_mod.add(rec["name"], prompt, at, label="wake")
+    # Key the job by channel id, not name. state.py works hard to survive a
+    # Discord rename; a job keyed by name would resolve to nothing afterwards
+    # and die as a .failed file, silently losing the continuation.
+    job = await asyncio.to_thread(wake_mod.add, str(channel_id), prompt, at, "wake")
     await channel.send(
         f"⏰ `{job['id']}` — {wake_mod.local(at)} "
         f"(in {wake_mod.human_delta(at - time.time())})"

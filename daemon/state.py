@@ -9,6 +9,7 @@ never changes once assigned.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shutil
@@ -17,6 +18,8 @@ import uuid
 from pathlib import Path
 
 from . import config
+
+log = logging.getLogger("rig.state")
 
 _SAFE = re.compile(r"[^a-z0-9._-]+")
 
@@ -36,13 +39,31 @@ class State:
 
     def load(self) -> None:
         if self.path.exists():
+            problem = None
             try:
                 self.data = json.loads(self.path.read_text(encoding="utf-8"))
-            except json.JSONDecodeError:
-                # Never start against a half-written file. Keep the corpse for
-                # forensics rather than overwriting it.
+                # Valid JSON is not necessarily a valid state file: `[]` or
+                # `null` parses fine and then explodes on setdefault below.
+                if not isinstance(self.data, dict):
+                    problem = f"top level is {type(self.data).__name__}, not an object"
+            except (json.JSONDecodeError, OSError) as exc:
+                problem = str(exc)
+            if problem:
+                # Never start against a bad file. Keep the corpse for forensics
+                # rather than overwriting it -- and say so loudly: booting with
+                # an empty registry means every channel silently gets a fresh
+                # session, which is indistinguishable from total amnesia.
                 backup = self.path.with_suffix(f".corrupt.{int(time.time())}")
-                shutil.copy2(self.path, backup)
+                try:
+                    shutil.copy2(self.path, backup)
+                except OSError:
+                    backup = None
+                log.error(
+                    "state.json is unreadable (%s) — starting with an EMPTY channel "
+                    "registry; every channel will begin a new session. Previous file "
+                    "saved as %s. Restore from `rig backup` to recover.",
+                    problem, backup,
+                )
                 self.data = {"channels": {}}
         self.data.setdefault("channels", {})
 
@@ -79,7 +100,7 @@ class State:
             "name": name,
             "workdir": str(self._new_workdir(channel_id, name)),
             "session_id": str(uuid.uuid4()),
-            "model": config.Config().default_model,
+            "model": os.environ.get("DEFAULT_MODEL", "opus"),
             "harness": "cc",  # carried from day one; the swap lands in Phase 6
             "primed": False,
             "started": int(time.time()),

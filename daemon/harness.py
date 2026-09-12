@@ -63,11 +63,23 @@ _STREAM_LIMIT = 32 * 1024 * 1024
 _STDIN_TIMEOUT = 30
 
 
+# error_kind values. Minted here, matched in bot._deliver -- constants rather
+# than bare strings so a typo is an AttributeError instead of a silently
+# generic error icon.
+KIND_TIMEOUT = "timeout"
+KIND_MISSING_TRANSCRIPT = "missing_transcript"
+KIND_SPAWN = "spawn"
+KIND_CLI = "cli"
+KIND_TRUNCATED = "truncated"
+KIND_NO_RESULT = "no_result"
+KIND_RIG = "rig"
+
+
 @dataclass
 class TurnResult:
     text: str = ""
     is_error: bool = False
-    error_kind: str | None = None  # timeout | missing_transcript | spawn | cli | truncated
+    error_kind: str | None = None
     exit_code: int | None = None
     stderr_tail: str = ""
     duration_ms: int = 0
@@ -76,6 +88,7 @@ class TurnResult:
     model_used: str | None = None
     resumed: bool = False
     dropped_events: int = 0
+    saw_result: bool = False
     tools: list[str] = field(default_factory=list)
 
 
@@ -86,10 +99,10 @@ class ClaudeHarness:
 
     # --- argv --------------------------------------------------------------
 
-    def _argv(self, rec: dict, model: str, resume: bool) -> list[str]:
-        session_flag = ["--resume", rec["session_id"]] if resume else [
+    def _argv(self, session_id: str, model: str, resume: bool) -> list[str]:
+        session_flag = ["--resume", session_id] if resume else [
             "--session-id",
-            rec["session_id"],
+            session_id,
         ]
         return [
             self.cfg.claude_bin,
@@ -109,6 +122,14 @@ class ClaudeHarness:
 
     def _child_env(self) -> dict[str, str]:
         env = dict(os.environ)
+        # Strip the rig's own credentials. A turn routinely ingests untrusted
+        # web pages and repos, so a single prompt injection that runs `printenv`
+        # would otherwise hand over the bot token -- and with it the ability to
+        # post as the rig, including forged injection lines. The child needs
+        # none of these.
+        for secret in ("DISCORD_BOT_TOKEN", "DISCORD_GUILD_ID",
+                       "DISCORD_ALLOWED_USER_IDS"):
+            env.pop(secret, None)
         # The box clock is UTC on Linux. Handing the child a real timezone kills
         # an entire class of "what day is it" bugs at the source.
         env["TZ"] = self.cfg.tz
@@ -128,15 +149,25 @@ class ClaudeHarness:
     ) -> TurnResult:
         workdir = rec["workdir"]
 
+        # Snapshot the identity this turn is bound to, ONCE.
+        #
+        # `rec` is the live dict inside State.data, and `!reset` bypasses the
+        # turn queue -- so a reset landing mid-turn mutates this very object.
+        # Reading rec["session_id"] lazily at event time made mark_primed's
+        # guard compare a value to itself, which silently defeated the guard and
+        # left the channel bricked on the missing-transcript gate. Everything
+        # below uses the snapshot; nothing re-reads rec for identity.
+        session_id = rec["session_id"]
+
         # A resume whose transcript has vanished must be loud. Silently starting
         # a fresh session here is indistinguishable from amnesia, and you would
         # not find out until the agent forgot something it should have known.
         if rec.get("primed"):
-            tpath = state_mod.transcript_path(workdir, rec["session_id"])
+            tpath = state_mod.transcript_path(workdir, session_id)
             if not tpath.exists():
                 return TurnResult(
                     is_error=True,
-                    error_kind="missing_transcript",
+                    error_kind=KIND_MISSING_TRANSCRIPT,
                     text=(
                         f"Session transcript is missing:\n`{tpath}`\n\n"
                         "This channel's memory cannot be resumed. Restore it from "
@@ -155,7 +186,8 @@ class ClaudeHarness:
 
             result = await self._attempt(
                 channel_id=channel_id,
-                rec=rec,
+                workdir=workdir,
+                session_id=session_id,
                 model=candidates[0],
                 resume=resume,
                 prompt=prompt,
@@ -168,7 +200,7 @@ class ClaudeHarness:
 
             # First turn died after init on a previous run: resume instead.
             if result.is_error and not resume and _SESSION_EXISTS.search(diagnostics):
-                self.state.mark_primed(channel_id, rec["session_id"])
+                self.state.mark_primed(channel_id, session_id)
                 resume = True
                 continue
 
@@ -178,7 +210,7 @@ class ClaudeHarness:
                 continue
 
             if result.is_error and resume and _NO_CONVERSATION.search(diagnostics):
-                result.error_kind = "missing_transcript"
+                result.error_kind = KIND_MISSING_TRANSCRIPT
 
             break
 
@@ -205,14 +237,15 @@ class ClaudeHarness:
         self,
         *,
         channel_id: int,
-        rec: dict,
+        workdir: str,
+        session_id: str,
         model: str,
         resume: bool,
         prompt: str,
         on_event,
         register_proc,
     ) -> TurnResult:
-        argv = self._argv(rec, model, resume)
+        argv = self._argv(session_id, model, resume)
         started = time.monotonic()
         result = TurnResult(model_used=model, resumed=resume)
 
@@ -222,7 +255,7 @@ class ClaudeHarness:
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                cwd=rec["workdir"],
+                cwd=workdir,
                 env=self._child_env(),
                 limit=_STREAM_LIMIT,
                 # Its own process group, so a timeout kills the whole tree
@@ -231,7 +264,7 @@ class ClaudeHarness:
             )
         except OSError as exc:
             result.is_error = True
-            result.error_kind = "spawn"
+            result.error_kind = KIND_SPAWN
             result.stderr_tail = f"could not spawn {self.cfg.claude_bin!r}: {exc}"
             return result
 
@@ -240,36 +273,54 @@ class ClaudeHarness:
 
         stderr_buf: list[str] = []
         stdout_task = asyncio.create_task(
-            self._read_stdout(proc, channel_id, rec, result, on_event)
+            self._read_stdout(proc, channel_id, session_id, result, on_event)
         )
         stderr_task = asyncio.create_task(self._read_stderr(proc, stderr_buf))
 
-        await self._write_prompt(proc, prompt)
-
         timed_out = False
         try:
-            await asyncio.wait_for(proc.wait(), timeout=self.cfg.turn_timeout)
-        except asyncio.TimeoutError:
-            timed_out = True
-            await self.kill(proc)
-        except asyncio.CancelledError:
-            await self.kill(proc)
-            stdout_task.cancel()
-            stderr_task.cancel()
-            raise
+            await self._write_prompt(proc, prompt)
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=self.cfg.turn_timeout)
+            except asyncio.TimeoutError:
+                timed_out = True
+        finally:
+            # Everything after a successful spawn lives under this finally, so
+            # no exception -- expected or not -- can leave a `claude` process
+            # group orphaned. An orphan is worse than a crash: it holds no
+            # semaphore slot, so the concurrency cap is silently exceeded by a
+            # process nobody is watching.
+            if proc.returncode is None:
+                await self.kill(proc)
+            outcomes = await asyncio.gather(
+                stdout_task, stderr_task, return_exceptions=True
+            )
 
-        await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+        # Never swallow a reader crash. return_exceptions keeps the gather from
+        # raising, but an unlogged failure here means a partial answer delivered
+        # under a success footer -- the exact silent-truncation class the stream
+        # limit was raised to close.
+        for outcome in outcomes:
+            if isinstance(outcome, BaseException) and not isinstance(
+                outcome, asyncio.CancelledError
+            ):
+                log.error("stream reader failed", exc_info=outcome)
+                result.is_error = True
+                result.error_kind = result.error_kind or KIND_RIG
+                result.stderr_tail = f"{result.stderr_tail}\nrig: {outcome!r}".strip()
 
         result.exit_code = proc.returncode
         result.duration_ms = int((time.monotonic() - started) * 1000)
-        result.stderr_tail = "".join(stderr_buf)[-_STDERR_KEEP:]
+        result.stderr_tail = (result.stderr_tail + "".join(stderr_buf))[-_STDERR_KEEP:]
 
         if timed_out:
             result.is_error = True
-            result.error_kind = "timeout"
-            result.text = (
-                f"Turn exceeded TURN_TIMEOUT ({self.cfg.turn_timeout}s) and was killed."
-            )
+            result.error_kind = KIND_TIMEOUT
+            notice = f"Turn exceeded TURN_TIMEOUT ({self.cfg.turn_timeout}s) and was killed."
+            # Append, never overwrite: a timed-out turn may have streamed real
+            # work before it died, and bot._deliver logs failures to history
+            # precisely so that work survives.
+            result.text = f"{result.text}\n\n{notice}".strip() if result.text else notice
         elif proc.returncode:
             # Any nonzero exit is a failure, even when text was streamed first.
             # Delivering a half-written answer with a success footer is worse
@@ -278,11 +329,20 @@ class ClaudeHarness:
             result.error_kind = result.error_kind or "cli"
         elif result.dropped_events and not result.text:
             result.is_error = True
-            result.error_kind = "truncated"
+            result.error_kind = KIND_TRUNCATED
             result.text = (
                 f"The CLI emitted {result.dropped_events} event(s) too large to read "
                 "and no final text survived. This is a bug in the rig, not your prompt."
             )
+        elif not result.saw_result:
+            # Exit 0 with no `result` event at all. Without this the turn is
+            # delivered under a success footer reading "(no text output)" --
+            # a turn that appears to succeed while doing nothing, which is this
+            # daemon's worst failure mode.
+            result.is_error = True
+            result.error_kind = KIND_NO_RESULT
+            text = "The CLI exited cleanly but never reported a result."
+            result.text = f"{result.text}\n\n{text}".strip() if result.text else text
 
         return result
 
@@ -313,7 +373,7 @@ class ClaudeHarness:
 
     # --- streams -----------------------------------------------------------
 
-    async def _read_stdout(self, proc, channel_id: int, rec: dict, result, on_event) -> None:
+    async def _read_stdout(self, proc, channel_id: int, session_id: str, result, on_event) -> None:
         assert proc.stdout is not None
         text_parts: list[str] = []
         while True:
@@ -333,6 +393,11 @@ class ClaudeHarness:
             try:
                 event = json.loads(line)
             except json.JSONDecodeError:
+                # Count it. An undecodable line is usually the tail of an
+                # oversized one we already dropped, and silently skipping it
+                # hid the fact that part of the stream never arrived.
+                result.dropped_events += 1
+                log.warning("unparseable stream-json line (%d bytes)", len(line))
                 continue
 
             kind = event.get("type")
@@ -341,7 +406,9 @@ class ClaudeHarness:
                 # By init the transcript exists on disk. Commit primed NOW: if
                 # we waited for the result and the turn then died, the next turn
                 # would retry --session-id against a live uuid, forever.
-                self.state.mark_primed(channel_id, rec["session_id"])
+                # session_id is the snapshot taken in run_turn, so a `!reset`
+                # racing this turn correctly makes the guard reject the write.
+                self.state.mark_primed(channel_id, session_id)
                 await on_event("init", event)
 
             elif kind == "assistant":
@@ -358,6 +425,7 @@ class ClaudeHarness:
                         await on_event("tool", label)
 
             elif kind == "result":
+                result.saw_result = True
                 result.text = event.get("result") or "".join(text_parts)
                 result.is_error = (
                     bool(event.get("is_error")) or event.get("subtype") != "success"
