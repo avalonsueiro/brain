@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import html
 import re
 import sys
 import time
@@ -47,7 +48,7 @@ def _body(payload: dict) -> str:
     Walks the MIME tree rather than assuming a shape -- multipart/alternative
     with a nested multipart/related is completely ordinary mail.
     """
-    plain, html = [], []
+    plain, html_parts = [], []
 
     def walk(part: dict) -> None:
         mime = part.get("mimeType", "")
@@ -56,12 +57,12 @@ def _body(payload: dict) -> str:
             if mime == "text/plain":
                 plain.append(_decode(data))
             elif mime == "text/html":
-                html.append(_decode(data))
+                html_parts.append(_decode(data))
         for child in part.get("parts") or []:
             walk(child)
 
     walk(payload)
-    text = "\n".join(plain) if plain else _TAGS.sub(" ", "\n".join(html))
+    text = "\n".join(plain) if plain else html.unescape(_TAGS.sub(" ", "\n".join(html_parts)))
     return _BLANKS.sub("\n\n", text).strip()
 
 
@@ -88,7 +89,8 @@ def list_messages(query: str, limit: int, days: int | None) -> int:
         })
         payload = msg.get("payload") or {}
         sender = _header(payload, "From")
-        snippet = " ".join((msg.get("snippet") or "").split())[:160]
+        # Gmail snippets arrive HTML-escaped: &quot; &amp; &#39;.
+        snippet = " ".join(html.unescape(msg.get("snippet") or "").split())[:160]
         unread = "●" if "UNREAD" in (msg.get("labelIds") or []) else " "
         print(f"{unread} [{msg_id}] {_when(msg.get('internalDate'))}  {sender}")
         print(f"    {_header(payload, 'Subject') or '(no subject)'}")

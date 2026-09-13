@@ -1460,6 +1460,24 @@ def test_gmail_parsing() -> None:
           gmail_mod._when(GMAIL_MSG["internalDate"]))
     check("a junk date does not raise", gmail_mod._when("banana") == "?")
 
+    # Found live: urlencode serialized the list's repr, Gmail ignored the
+    # malformed param, and every message came back with no From or Subject.
+    import urllib.parse as _up
+    encoded = _up.urlencode({"metadataHeaders": ["From", "Subject"]}, doseq=True)
+    check("list params encode as repeated keys",
+          encoded == "metadataHeaders=From&metadataHeaders=Subject", encoded)
+    check("api_get uses doseq",
+          "doseq=True" in Path(gauth.__file__).read_text())
+
+    # Gmail snippets and HTML bodies arrive escaped.
+    escaped = {"mimeType": "text/html",
+               "body": {"data": base64.urlsafe_b64encode(
+                   b"<p>say &quot;hello&quot; &amp; wave</p>").decode()}}
+    unescaped = gmail_mod._body(escaped)
+    check("html entities are decoded",
+          '"hello"' in unescaped and "&" in unescaped and "&quot;" not in unescaped,
+          repr(unescaped))
+
     check("base64url without padding decodes",
           gmail_mod._decode(base64.urlsafe_b64encode(b"abcde").decode().rstrip("=")) == "abcde")
 

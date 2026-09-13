@@ -115,7 +115,10 @@ def access_token() -> str:
 def api_get(url: str, params: dict | None = None) -> dict:
     """Authorized GET. Retries once on 401 in case the token died early."""
     for attempt in (1, 2):
-        full = url + ("?" + urllib.parse.urlencode(params) if params else "")
+        # doseq: a list value must become repeated params. Without it urlencode
+        # serializes the list's repr, Gmail silently ignores the malformed
+        # metadataHeaders, and every message comes back with no From or Subject.
+        full = url + ("?" + urllib.parse.urlencode(params, doseq=True) if params else "")
         req = urllib.request.Request(full)
         req.add_header("Authorization", f"Bearer {access_token()}")
         try:
