@@ -11,6 +11,7 @@ to discover in production.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import shutil
@@ -1357,6 +1358,142 @@ def _is_readonly(db) -> bool:
         return True
 
 
+# --- google skills (no network: fixtures only) ------------------------------
+
+sys.path.insert(0, str(ROOT / "skills" / "google"))
+import auth as gauth  # noqa: E402
+import gmail as gmail_mod  # noqa: E402
+import gcal as gcal_mod  # noqa: E402
+
+
+def test_google_credentials_are_private() -> None:
+    print("\ngoogle: credential handling")
+    os.environ["RIG_ROOT"] = str(config.RIG_ROOT)
+    config.ensure_dirs()
+    gauth.env_file().unlink(missing_ok=True)
+
+    gauth._write_env({"CLIENT_ID": "abc", "CLIENT_SECRET": "shhh"})
+    mode = oct(gauth.env_file().stat().st_mode & 0o777)
+    # A refresh token is a standing grant to read the operator's mail; 0644
+    # would hand it to every account on the box.
+    check("google.env is written 0600", mode == "0o600", mode)
+    check("it lives outside the repo, in the state dir",
+          str(config.STATE_DIR) in str(gauth.env_file()))
+    check("values round-trip", gauth._read_env()["CLIENT_SECRET"] == "shhh")
+    check("no .env tmp file is left behind",
+          not list(config.STATE_DIR.glob("*.env.tmp")))
+
+    # Missing credentials must name what is missing rather than raising a
+    # urllib error from somewhere deep in a refresh.
+    gauth._write_env({"CLIENT_ID": "abc"})
+    try:
+        gauth.access_token()
+        check("missing credentials raise", False, "no exception")
+    except RuntimeError as exc:
+        check("missing credentials raise", True)
+        check("and the message names what is missing",
+              "CLIENT_SECRET" in str(exc) and "REFRESH_TOKEN" in str(exc), str(exc))
+
+    gauth._write_env({"CLIENT_ID": "a", "CLIENT_SECRET": "b", "REFRESH_TOKEN": "c",
+                      "ACCESS_TOKEN": "cached", "EXPIRES_AT": str(int(time.time()) + 3600)})
+    check("a live cached token is reused, not refreshed", gauth.access_token() == "cached")
+    gauth._write_env({"CLIENT_ID": "a", "CLIENT_SECRET": "b", "REFRESH_TOKEN": "c",
+                      "ACCESS_TOKEN": "stale",
+                      "EXPIRES_AT": str(int(time.time()) + 10)})
+    # 10s of life left is inside the 60s safety margin, so it must refresh --
+    # which will fail without network, proving it tried.
+    try:
+        gauth.access_token()
+        check("a nearly-expired token is not reused", False, "returned the stale one")
+    except RuntimeError:
+        check("a nearly-expired token is not reused", True)
+    gauth.env_file().unlink(missing_ok=True)
+
+
+GMAIL_MSG = {
+    "id": "m1", "threadId": "t1", "internalDate": "1757800000000",
+    "labelIds": ["INBOX", "UNREAD"], "snippet": "lunch thursday?",
+    "payload": {
+        "mimeType": "multipart/alternative",
+        "headers": [{"name": "From", "value": "Akeil <akeils@andrew.cmu.edu>"},
+                    {"name": "Subject", "value": "outlate"},
+                    {"name": "To", "value": "avalon@sueiro.me"},
+                    {"name": "Date", "value": "Sat, 13 Sep 2026 10:00:00 -0400"}],
+        "parts": [
+            {"mimeType": "text/plain",
+             "body": {"data": base64.urlsafe_b64encode(b"the plain part").decode()}},
+            {"mimeType": "multipart/related", "parts": [
+                {"mimeType": "text/html",
+                 "body": {"data": base64.urlsafe_b64encode(b"<p>the html part</p>").decode()}}]},
+        ],
+    },
+}
+
+
+def test_gmail_parsing() -> None:
+    print("\ngmail: MIME and header handling")
+    payload = GMAIL_MSG["payload"]
+    check("header lookup is case-insensitive",
+          gmail_mod._header(payload, "from") == "Akeil <akeils@andrew.cmu.edu>")
+    check("a missing header is empty, not an error", gmail_mod._header(payload, "Nope") == "")
+
+    body = gmail_mod._body(payload)
+    # Real mail nests multipart/related inside multipart/alternative; assuming a
+    # flat shape silently returns nothing.
+    check("text/plain wins over html", body == "the plain part", repr(body))
+
+    html_only = {"mimeType": "text/html",
+                 "body": {"data": base64.urlsafe_b64encode(
+                     b"<div><p>hello</p><br/>there</div>").decode()}}
+    stripped = gmail_mod._body(html_only)
+    check("html falls back with tags stripped",
+          "hello" in stripped and "<p>" not in stripped, repr(stripped))
+    check("an empty payload yields empty text", gmail_mod._body({}) == "")
+    check("nested parts are reached",
+          "the html part" in gmail_mod._body(
+              {"parts": [{"mimeType": "multipart/related", "parts": [payload["parts"][1]]}]}))
+
+    expected = time.strftime("%Y-%m-%d %H:%M",
+                             time.localtime(int(GMAIL_MSG["internalDate"]) / 1000))
+    check("internalDate renders as local time",
+          gmail_mod._when(GMAIL_MSG["internalDate"]) == expected,
+          gmail_mod._when(GMAIL_MSG["internalDate"]))
+    check("a junk date does not raise", gmail_mod._when("banana") == "?")
+
+    check("base64url without padding decodes",
+          gmail_mod._decode(base64.urlsafe_b64encode(b"abcde").decode().rstrip("=")) == "abcde")
+
+
+def test_gcal_parsing() -> None:
+    print("\ngcal: event shaping")
+    os.environ["RIG_TZ"] = "America/New_York"
+    start, all_day = gcal_mod._parse({"dateTime": "2026-09-20T14:30:00-04:00"})
+    check("a timed event parses", start.hour == 14 and not all_day, str(start))
+    start, all_day = gcal_mod._parse({"date": "2026-09-20"})
+    check("an all-day event is flagged", all_day is True)
+    check("an empty start is handled", gcal_mod._parse({}) == (None, False))
+
+    # RIG_TZ must actually apply -- an agent reasoning about "this afternoon"
+    # off a UTC clock is how a reminder lands at 3am.
+    os.environ["RIG_TZ"] = "America/Los_Angeles"
+    west, _ = gcal_mod._parse({"dateTime": "2026-09-20T14:30:00-04:00"})
+    check("times render in RIG_TZ", west.hour == 11, str(west))
+    os.environ["RIG_TZ"] = "America/New_York"
+
+
+def test_google_is_read_only() -> None:
+    print("\ngoogle: read-only by construction")
+    check("scopes are readonly only",
+          all(s.endswith(".readonly") for s in gauth.SCOPES), str(gauth.SCOPES))
+    # The guardrail is that outward actions need explicit go-ahead. A skill that
+    # cannot send cannot break that rule by accident.
+    for module, forbidden in ((gmail_mod, ("send", "trash", "delete", "modify")),
+                              (gcal_mod, ("insert", "delete", "patch", "update"))):
+        source = Path(module.__file__).read_text()
+        offenders = [w for w in forbidden if f'"{w}"' in source or f"/{w}" in source]
+        check(f"{Path(module.__file__).name} has no write verbs", not offenders, str(offenders))
+
+
 def test_compaction_detection() -> None:
     print("\ncompaction detection")
     st = fresh_state()
@@ -1452,6 +1589,10 @@ def main() -> int:
         test_graph_concurrent_writers()
         test_history_writer()
         test_recall_reader()
+        test_google_credentials_are_private()
+        test_gmail_parsing()
+        test_gcal_parsing()
+        test_google_is_read_only()
         test_compaction_detection()
     finally:
         shutil.rmtree(TMP, ignore_errors=True)

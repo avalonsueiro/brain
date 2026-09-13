@@ -313,7 +313,7 @@ cmd_backup() {
   STAGE="$(mktemp -d)"
   mkdir -p "$STAGE/state" "$STAGE/transcripts"
 
-  for f in state.json jobs.json agent.env; do
+  for f in state.json jobs.json agent.env google.env; do
     [ -e "$STATE_DIR/$f" ] && cp -a "$STATE_DIR/$f" "$STAGE/state/" || true
   done
   # sqlite3 .backup, not cp: the daemon writes this DB continuously, and copying
@@ -447,6 +447,7 @@ cmd_doctor() {
   chk "agent.env exists"               "[ -f '$STATE_DIR/agent.env' ]"
   chk "agent.env is 0600"              "[ \"\$(stat -f %Lp '$STATE_DIR/agent.env' 2>/dev/null || stat -c %a '$STATE_DIR/agent.env')\" = 600 ]"
   chk "inject/ exists"                 "[ -d '$RIG_ROOT/inject' ]"
+  chk "google.env is 0600 (if present)" "[ ! -f '$STATE_DIR/google.env' ] || [ \"\$(stat -f %Lp '$STATE_DIR/google.env' 2>/dev/null || stat -c %a '$STATE_DIR/google.env')\" = 600 ]"
   chk "inject/ is 0700"                "[ \"\$(stat -f %Lp '$RIG_ROOT/inject' 2>/dev/null || stat -c %a '$RIG_ROOT/inject')\" = 700 ]"
   chk "DISCORD_BOT_TOKEN set"          "grep -q '^DISCORD_BOT_TOKEN=.\\+' '$STATE_DIR/agent.env'"
   chk "DISCORD_ALLOWED_USER_IDS set"   "grep -q '^DISCORD_ALLOWED_USER_IDS=.\\+' '$STATE_DIR/agent.env'"

@@ -231,7 +231,7 @@ Three things worth knowing:
 
 ```bash
 cd /opt/agent-rig/brain
-.venv/bin/python tests/test_rig.py    # 129 offline checks, no Discord, no tokens
+.venv/bin/python tests/test_rig.py    # 286 offline checks, no Discord, no network
 bin/rig doctor
 ```
 
@@ -260,6 +260,27 @@ There is no equivalent on the default macOS install, because there is no
 separate account to be denied by.
 
 ---
+
+## Skills — what your agents can actually do
+
+Linked into the rig user's `~/.claude/skills/` by `rig link-skills`:
+
+| Skill | Does |
+|---|---|
+| `graph` | The shared memory graph. Survives `!reset`, visible from every channel |
+| `recall` | Full-text search over the turn log — what compaction took out of context |
+| `wake` | Book a future turn |
+| `inject` | Start a turn from cron or a script |
+| `google` | Read-only Gmail and Calendar (one-time OAuth — see [SKILLS.md](SKILLS.md)) |
+
+Every channel's `CLAUDE.md` carries a standing rule to **investigate before
+answering** — graph first, then `recall`, then email and calendar — and to write
+what it learns back to the graph. That instruction is why the memory compounds
+instead of just existing.
+
+`rig reseed` refreshes every existing channel's `CLAUDE.md` from the template.
+Run it after changing the standing rules: `_seed_workdir` only writes the file
+when it is absent, so channels created earlier would never see the change.
 
 ## Hard-won rules
 

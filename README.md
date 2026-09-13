@@ -52,7 +52,7 @@ skills/inject/ start a turn from cron, a git hook, anything
 bin/rig        bootstrap · venv · install · start/stop · logs · backup · doctor
 infra/         launchd plists (macOS) and systemd units (Linux)
 templates/     the CLAUDE.md seeded into every channel workdir
-tests/         129 offline checks — no Discord, no tokens
+tests/         286 offline checks — no Discord, no network
 ```
 
 ## Two settings that will bite you
@@ -94,8 +94,22 @@ continuing its own work all use the same seam.
 The second one is the real unlock: a session cannot stay resident, so an agent
 that needs to check back in twenty minutes books a wake and exits.
 
+## What the agents can do
+
+```
+graph     shared memory — people, projects, decisions. Survives !reset
+recall    full-text search over every turn ever logged
+wake      book a future turn
+inject    start a turn from cron or a script
+google    read-only Gmail and Calendar
+```
+
+Each is a plain CLI, which is the point: a capability that is a command-line
+tool is model-independent. Swap the harness, keep the tools.
+
 ## Status
 
-Phases 1 and 2 are built: the daemon and session-per-message loop, plus the
-inject spool and wake scheduler. Later phases — the memory graph, the agent
-fleet, ticket→PR, the automation layer — are deliberately not started yet.
+Phases 1-3 are built: the daemon and session-per-message loop, the inject spool
+and wake scheduler, and the memory layer — a shared graph, turn-log recall, and
+read-only Gmail/Calendar. The fleet, the build factory, and the automation layer
+(Phases 4-6) are deliberately not started yet.
