@@ -20,6 +20,8 @@ HELP = """```
 !wake in 2h <text>       book a future turn in this channel
 !wake at 18:30 <text>    same, at a clock time
 !wake list | cancel <id>
+!fleet                   every channel, its session and activity
+!fleet pause | resume    stop/start serving THIS channel
 ```"""
 
 WAKE_HELP = (
@@ -170,7 +172,65 @@ async def handle(bot, message, content: str) -> None:
         await _wake(bot, channel, rec, args)
         return
 
+    if cmd == "fleet":
+        await _fleet(bot, channel, rec, args)
+        return
+
     await channel.send(f"unknown command `!{cmd}`\n{HELP}")
+
+
+async def _fleet(bot, channel, rec, args: list[str]) -> None:
+    """See the whole fleet, and stop a channel that has gone wrong.
+
+    With collab fully open, any agent can message or spawn any other. This is
+    the compensating control: one place to see what exists, and one switch to
+    stop a channel without destroying what it knows.
+    """
+    sub = (args[0].lower() if args else "list")
+
+    if sub in ("pause", "resume"):
+        archived = sub == "pause"
+        bot.state.update(channel.id, archived=archived)
+        if archived:
+            # Drop anything already queued: pausing a channel that then answers
+            # three backlogged messages is not a pause.
+            queue = bot.queues.get(channel.id)
+            dropped = 0
+            while queue is not None and not queue.empty():
+                try:
+                    queue.get_nowait()
+                    queue.task_done()
+                    dropped += 1
+                except asyncio.QueueEmpty:
+                    break
+            await bot.abort(channel.id)
+            await channel.send(
+                f"⏸️ paused — this channel will not run turns."
+                + (f" Dropped {dropped} queued message(s)." if dropped else "")
+                + "\nIts session and transcript are untouched. `!fleet resume` to restart."
+            )
+        else:
+            await channel.send("▶️ resumed.")
+        return
+
+    lines = []
+    for rec_ in sorted(bot.state.all().values(), key=lambda r: r.get("name") or ""):
+        last = rec_.get("last_turn")
+        ago = _age(last) if last else "never"
+        here = " ←" if rec_.get("name") == rec.get("name") else ""
+        flags = " [paused]" if rec_.get("archived") else ""
+        live = " [running]" if any(
+            str(cid) == str(rec_.get("channel_id", "")) for cid in bot.running
+        ) else ""
+        lines.append(
+            f"#{rec_.get('name', '?'):<16} {rec_.get('model', '?'):<7} "
+            f"{rec_.get('turns', 0):>4} turns  last {ago}{flags}{live}{here}"
+        )
+    running = len(bot.running)
+    await channel.send(
+        "```\n" + "\n".join(lines) + "\n```"
+        + f"{len(lines)} channel(s), {running} turn(s) running"
+    )
 
 
 async def _wake(bot, channel, rec, args: list[str]) -> None:

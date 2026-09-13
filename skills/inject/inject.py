@@ -25,15 +25,35 @@ import sys
 import time
 from pathlib import Path
 
-RIG_ROOT = Path(os.environ.get("RIG_ROOT", "/opt/agent-rig"))
-INJECT_DIR = RIG_ROOT / "inject"
+DEFAULT_RIG_ROOT = "/opt/agent-rig"
 
 
-def inject(channel: str, text: str, label: str = "inject") -> Path:
-    INJECT_DIR.mkdir(parents=True, exist_ok=True)
-    name = f"{int(time.time() * 1000)}-{random.randint(1000, 9999)}"
-    tmp = INJECT_DIR / f"{name}.json.tmp"
-    final = INJECT_DIR / f"{name}.json"
+# Resolved per call, never snapshotted at import: the daemon loads this module
+# before config.load_env() runs, and a frozen path would silently ignore
+# agent.env -- and make the test sandbox an accident of import ordering.
+def rig_root() -> Path:
+    return Path(os.environ.get("RIG_ROOT", DEFAULT_RIG_ROOT))
+
+
+def spool_dir() -> Path:
+    return rig_root() / "inject"
+
+
+def inject(channel: str, text: str, label: str = "inject",
+           inject_dir: Path | None = None) -> Path:
+    """Publish an inject file. THE single implementation of the spool format.
+
+    The daemon imports this rather than keeping its own copy: collab would have
+    made a third, and a format that three files agree on only by coincidence
+    drifts the first time one of them changes.
+    """
+    inject_dir = inject_dir or spool_dir()
+    inject_dir.mkdir(parents=True, exist_ok=True)
+    # Millisecond timestamp for FIFO ordering, pid+random so two writers in the
+    # same millisecond cannot clobber each other.
+    name = f"{int(time.time() * 1000)}-{os.getpid()}-{random.randint(1000, 9999)}"
+    tmp = inject_dir / f"{name}.json.tmp"
+    final = inject_dir / f"{name}.json"
     # Write .tmp then rename: the poller globs *.json, so it can never read a
     # half-written file.
     tmp.write_text(

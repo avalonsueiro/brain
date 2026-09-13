@@ -27,7 +27,7 @@ from pathlib import Path
 
 import discord
 
-from . import config
+from . import _skills, config
 
 log = logging.getLogger("rig.spool")
 
@@ -45,32 +45,16 @@ def _clean_label(raw) -> str:
         return "inject"
     return _LABEL_OK.sub("", raw).strip()[:MAX_LABEL] or "inject"
 
-# Import the wake module from skills/ -- the CLI agents call and the daemon are
-# the same implementation, so `!wake` and `wake.py add` cannot drift apart.
-import sys
+# The CLIs agents shell out to ARE the daemon's implementations -- loaded by
+# path rather than by mutating sys.path, so a file dropped into a skill folder
+# cannot shadow stdlib for the whole daemon.
+wake_mod = _skills.load("wake")
+_inject_mod = _skills.load("inject")
 
-sys.path.insert(0, str(config.REPO_DIR / "skills" / "wake"))
-import wake as wake_mod  # noqa: E402
-
-
-def write_inject(
-    channel: str,
-    text: str,
-    label: str = "inject",
-    inject_dir: Path | None = None,
-) -> Path:
-    """Publish an inject file. Atomic: .tmp first, then rename into place."""
-    inject_dir = inject_dir or config.INJECT_DIR
-    inject_dir.mkdir(parents=True, exist_ok=True)
-    name = f"{int(time.time() * 1000)}-{random.randint(1000, 9999)}"
-    tmp = inject_dir / f"{name}.json.tmp"
-    final = inject_dir / f"{name}.json"
-    tmp.write_text(
-        json.dumps({"channel": channel, "text": text, "label": label}),
-        encoding="utf-8",
-    )
-    os.replace(tmp, final)
-    return final
+# One writer, three callers (daemon, inject CLI, collab). Aliased rather than
+# reimplemented: a spool format that three files agree on only by coincidence
+# drifts the first time one of them changes.
+write_inject = _inject_mod.inject
 
 
 class Spool:
@@ -78,6 +62,7 @@ class Spool:
         self.bot = bot
         self.cfg = bot.cfg
         self.tasks: list[asyncio.Task] = []
+        self.control = Control(self)
 
     def start(self) -> None:
         """Called from setup_hook, which runs exactly once.
@@ -88,6 +73,7 @@ class Spool:
         self.tasks = [
             asyncio.create_task(self._inject_loop(), name="rig-inject"),
             asyncio.create_task(self._wake_loop(), name="rig-wake"),
+            asyncio.create_task(self._control_loop(), name="rig-control"),
         ]
         log.info(
             "spool started: inject every %ds from %s, wake every %ds",
@@ -246,6 +232,70 @@ class Spool:
                 return channel
         return None
 
+    # --- control -----------------------------------------------------------
+
+    async def _control_loop(self) -> None:
+        await self.bot.wait_until_ready()
+        while not self.bot.draining:
+            try:
+                await self._drain_control_dir()
+            except Exception:
+                log.exception("control sweep failed")
+            await asyncio.sleep(self.cfg.inject_poll)
+
+    async def _drain_control_dir(self) -> None:
+        if not config.CONTROL_DIR.exists():
+            return
+        for path in sorted(config.CONTROL_DIR.glob("*.json")):
+            if self.bot.draining:
+                return
+            await self._handle_control(path)
+
+    async def _handle_control(self, path: Path) -> None:
+        """Every request ends .done or .failed, and says why.
+
+        A spawn that quietly failed is how an orchestrator ends up talking to a
+        channel that does not exist, so the outcome is both recorded on disk and
+        posted back to whoever asked.
+        """
+        req: dict = {}
+        try:
+            req = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(req, dict):
+                raise ControlError(f"payload is {type(req).__name__}, not an object")
+            action = req.get("action")
+            handler = self.control.actions.get(action)
+            if handler is None:
+                raise ControlError(
+                    f"unknown action {action!r} "
+                    f"(have: {', '.join(self.control.actions)})"
+                )
+            outcome = await handler(req)
+            ok = True
+        except ControlError as exc:
+            outcome, ok = str(exc), False
+        except (json.JSONDecodeError, OSError) as exc:
+            outcome, ok = f"unreadable request: {exc}", False
+        except Exception as exc:
+            log.exception("control %s blew up", path.name)
+            outcome, ok = f"internal error: {exc!r}", False
+
+        try:
+            path.rename(path.with_suffix(f".json.{'done' if ok else 'failed'}"))
+        except OSError:
+            pass
+
+        log.info("control %s: %s", "ok" if ok else "FAILED", outcome)
+        reply_to = req.get("reply_to") if isinstance(req, dict) else None
+        if reply_to:
+            channel = self._resolve(str(reply_to))
+            if channel is not None:
+                icon = "🌱" if ok else "⚠️"
+                try:
+                    await channel.send(f"{icon} control: {outcome}")
+                except discord.HTTPException:
+                    pass
+
     # --- wake --------------------------------------------------------------
 
     async def _wake_loop(self) -> None:
@@ -311,3 +361,142 @@ def _fail(path: Path) -> None:
         path.rename(path.with_suffix(path.suffix + ".failed"))
     except OSError:
         pass
+
+
+# --- CONTROL ---------------------------------------------------------------
+#
+# The privileged verb. Creating a channel means creating a Discord channel,
+# minting a session uuid, seeding a workdir and running a first turn -- all of
+# which only the daemon can do, because only the daemon holds the Discord client
+# and state.json. Everything else asks by dropping a file here.
+
+
+def write_control(action: str, control_dir: Path | None = None, **fields) -> Path:
+    """Publish a control request. Same atomic discipline as the inject spool."""
+    control_dir = control_dir or config.CONTROL_DIR
+    control_dir.mkdir(parents=True, exist_ok=True)
+    name = f"{int(time.time() * 1000)}-{os.getpid()}-{random.randint(1000, 9999)}"
+    tmp = control_dir / f"{name}.json.tmp"
+    final = control_dir / f"{name}.json"
+    tmp.write_text(json.dumps({"action": action, **fields}), encoding="utf-8")
+    os.replace(tmp, final)
+    return final
+
+
+class ControlError(Exception):
+    """A request that cannot be honoured, with a reason worth reporting."""
+
+
+class Control:
+    """Handlers for the control spool. Split from Spool so the dispatch table
+    is a dict of named methods rather than a branching if-chain."""
+
+    def __init__(self, spool: "Spool") -> None:
+        self.spool = spool
+        self.bot = spool.bot
+        self.cfg = spool.cfg
+        self._spawns: list[float] = []      # timestamps, for the rate limit
+
+    @property
+    def actions(self) -> dict:
+        return {
+            "create_channel": self.create_channel,
+            "archive_channel": self.archive_channel,
+            "set_model": self.set_model,
+        }
+
+    # --- rate limit --------------------------------------------------------
+
+    def _check_spawn_budget(self) -> None:
+        cutoff = time.time() - 3600
+        self._spawns = [t for t in self._spawns if t > cutoff]
+        if len(self._spawns) >= self.cfg.max_spawns_per_hour:
+            raise ControlError(
+                f"spawn rate limit reached ({self.cfg.max_spawns_per_hour}/hour). "
+                "Something is probably looping — check !fleet."
+            )
+
+    # --- actions -----------------------------------------------------------
+
+    async def create_channel(self, req: dict) -> str:
+        name = _clean_channel_name(req.get("name"))
+        if not name:
+            raise ControlError("create_channel needs a 'name'")
+
+        guild = self.bot.get_guild(self.cfg.guild_id)
+        if guild is None:
+            raise ControlError("guild unavailable")
+
+        existing = next((c for c in guild.text_channels if c.name == name), None)
+        if existing is not None:
+            raise ControlError(f"#{name} already exists")
+
+        self._check_spawn_budget()
+        try:
+            channel = await guild.create_text_channel(
+                name, topic=(req.get("topic") or "")[:1024] or None
+            )
+        except discord.Forbidden:
+            raise ControlError(
+                "the bot lacks MANAGE_CHANNELS — re-invite it with that permission "
+                "(see docs/SETUP.md)"
+            ) from None
+        except discord.HTTPException as exc:
+            raise ControlError(f"Discord refused to create #{name}: {exc}") from None
+
+        self._spawns.append(time.time())
+        rec = self.bot.state.register(channel.id, name)
+        if req.get("model"):
+            self.bot.state.update(channel.id, model=req["model"])
+
+        await self.spool._audit_post(
+            channel, "rig",
+            f"This channel is now an agent session.\n"
+            f"Workdir `{rec['workdir']}` · session `{rec['session_id'][:8]}`",
+        )
+
+        prime = (req.get("prime") or "").strip()
+        if prime:
+            # raw=True: the prime is this agent's charter, not something a
+            # colleague said. Wrapping it in "[via Discord #x]\nsomeone: ..."
+            # would make its founding instruction read as passing chatter.
+            self.bot._queue_for(channel.id).put_nowait(
+                {"author": "rig", "text": prime, "channel": channel, "raw": True}
+            )
+        log.info("control: created #%s (%s)", name, channel.id)
+        return f"created #{name} and primed it" if prime else f"created #{name}"
+
+    async def archive_channel(self, req: dict) -> str:
+        """Stop serving a channel. The transcript and the Discord channel stay.
+
+        Reversible on purpose -- a channel that has gone wrong should be
+        stoppable without destroying what it knew.
+        """
+        name = _clean_channel_name(req.get("name"))
+        target = self.spool._resolve(name)
+        if target is None:
+            raise ControlError(f"no channel #{name}")
+        self.bot.state.update(target.id, archived=True)
+        return f"#{name} archived — it will not run turns until un-archived"
+
+    async def set_model(self, req: dict) -> str:
+        name = _clean_channel_name(req.get("name"))
+        alias = (req.get("model") or "").strip()
+        if alias not in config.MODELS:
+            raise ControlError(f"unknown model {alias!r} ({', '.join(config.MODELS)})")
+        target = self.spool._resolve(name)
+        if target is None:
+            raise ControlError(f"no channel #{name}")
+        self.bot.state.update(target.id, model=alias, model_resolved=None)
+        return f"#{name} now uses {alias}"
+
+
+_CHANNEL_OK = re.compile(r"[^a-z0-9\-]+")
+
+
+def _clean_channel_name(raw) -> str:
+    """Discord lowercases and hyphenates anyway; do it up front so the name we
+    record in state matches the name Discord actually creates."""
+    if not isinstance(raw, str):
+        return ""
+    return _CHANNEL_OK.sub("-", raw.strip().lower().lstrip("#")).strip("-")[:90]

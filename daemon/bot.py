@@ -146,6 +146,13 @@ class RigBot(discord.Client):
             return
 
         rec = self.state.register(message.channel.id, name)
+        if rec.get("archived"):
+            # Stopped deliberately (`!fleet pause` or control). Say so rather
+            # than swallowing the message -- silence looks like a broken rig.
+            await message.channel.send(
+                "⏸️ this channel is paused. `!fleet resume` here to restart it."
+            )
+            return
         if self.history:
             self.history.log_inbound(message.channel.id, name, rec, message.author, content)
 

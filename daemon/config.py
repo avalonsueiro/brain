@@ -30,6 +30,11 @@ STATE_DIR = RIG_ROOT / "state"
 # line to its channel.
 INJECT_DIR = RIG_ROOT / "inject"
 
+# The privileged spool. Only the daemon owns the Discord client and state.json,
+# so creating a channel, registering a session and priming it can only happen
+# here -- a control file is how anything else asks.
+CONTROL_DIR = RIG_ROOT / "control"
+
 ENV_FILE = STATE_DIR / "agent.env"
 STATE_FILE = STATE_DIR / "state.json"
 JOBS_FILE = STATE_DIR / "jobs.json"
@@ -46,8 +51,9 @@ TEMPLATE_CLAUDE_MD = REPO_DIR / "templates" / "workdir-CLAUDE.md"
 def ensure_dirs() -> None:
     for d in (WORKDIRS_DIR, STATE_DIR, BACKUP_DIR, LOG_DIR):
         d.mkdir(parents=True, exist_ok=True)
-    INJECT_DIR.mkdir(parents=True, exist_ok=True)
-    INJECT_DIR.chmod(0o700)
+    for spool in (INJECT_DIR, CONTROL_DIR):
+        spool.mkdir(parents=True, exist_ok=True)
+        spool.chmod(0o700)
 
 
 # --- environment -----------------------------------------------------------
@@ -119,6 +125,11 @@ class Config:
         # so jobs routinely come due with nothing running; a two-hour-late
         # reminder is still useful, a thirteen-hour-late one is noise.
         self.wake_max_late = _int("WAKE_MAX_LATE", 12 * 3600)
+
+        # Fully-open collab means a confused or prompt-injected agent can spawn
+        # agents, and each one is a live session with its own cost. This is the
+        # difference between a bad turn and a bad afternoon.
+        self.max_spawns_per_hour = _int("MAX_SPAWNS_PER_HOUR", 6)
 
         # Must stay strictly BELOW the supervisor's kill timer (ExitTimeOut /
         # TimeoutStopSec, both 300) or a drain that uses its full window races
